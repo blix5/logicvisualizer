@@ -1,0 +1,22 @@
+// Bundles the modules under test to .test-build/ so plain node --test files can
+// import them without a TypeScript loader.
+import { build } from 'esbuild';
+
+await build({
+  entryPoints: {
+    timebase: 'src/shared/timebase.ts',
+    logicAudio: 'src/main/logic/logicAudio.ts',
+    logicAutomation: 'src/main/logic/logicAutomation.ts',
+    midiRegions: 'src/main/logic/midiRegions.ts',
+    buildProject: 'src/main/project/buildProject.ts',
+    peaks: 'src/renderer/render/peaks.ts',
+  },
+  bundle: true,
+  platform: 'node',
+  format: 'esm',
+  target: 'node20',
+  outdir: '.test-build',
+  outExtension: { '.js': '.mjs' },
+  external: ['electron'],
+  logLevel: 'error',
+});

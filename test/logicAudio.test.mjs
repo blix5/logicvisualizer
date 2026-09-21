@@ -1,0 +1,152 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  parseAudioFiles, parseAudioRegions, parseArrangeUnits, placedAudioRegions, ARRANGE_TICK_ORIGIN,
+} from '../.test-build/logicAudio.mjs';
+
+const BAR_TICKS = 3840;
+
+// Builds ProjectData-shaped buffers using the real on-disk layouts, so the
+// parser exercises its actual code paths rather than a simplified stand-in.
+
+function auFl(fileName) {
+  const name = Buffer.from(fileName, 'utf16le');
+  const record = Buffer.alloc(2 + name.length + 4 + 200);
+  record.writeUInt16LE(fileName.length, 0);
+  name.copy(record, 2);
+  record.write('LFUA', 2 + name.length, 'ascii');
+  return record;
+}
+
+function auRg({ name, oid, lengthSamples = 88_200, fileStartSamples = 0 }) {
+  const record = Buffer.alloc(300);
+  record.write('gRuA', 0, 'ascii');
+  record.writeUInt32LE(oid, 10);
+  record.writeUInt32LE(fileStartSamples, 42);
+  record.writeUInt32LE(lengthSamples, 58);
+  record.writeUInt16LE(name.length, 110);
+  record.write(name, 112, 'latin1');
+  return record;
+}
+
+/** A qSvE whose payload is a whole number of 80-byte arrangement units. */
+function arrangeList(units, { markerFor = () => 0x24 } = {}) {
+  const payload = units.length * 80;
+  const chunk = Buffer.alloc(36 + payload + 8);
+  chunk.write('qSvE', 0, 'ascii');
+  chunk.writeUInt32LE(payload + 16, 28); // block length carries a +16 bias
+  units.forEach((unit, i) => {
+    const at = 36 + i * 80;
+    chunk.writeUInt32LE(markerFor(i), at);
+    chunk.writeUInt32LE(ARRANGE_TICK_ORIGIN + unit.bar * BAR_TICKS, at + 4);
+    chunk.writeUInt32LE(unit.trackRef ?? 88, at + 16);
+    chunk.writeUInt8(unit.trackNumber ?? 1, at + 20);
+    chunk.writeUInt32LE(unit.regionRef, at + 44);
+    chunk.writeInt8(unit.gainDb ?? 0, at + 52);
+  });
+  return chunk;
+}
+
+test('audio file names decode from UTF-16LE before the tag', () => {
+  const buffer = Buffer.concat([Buffer.alloc(64), auFl('kick.wav'), auFl('vocals #12.wav')]);
+  const files = parseAudioFiles(buffer);
+  assert.deepEqual(files.map((f) => f.fileName), ['kick.wav', 'vocals #12.wav']);
+});
+
+test('region definitions carry an oid, a length and a trim-in', () => {
+  const buffer = Buffer.concat([
+    Buffer.alloc(32),
+    auRg({ name: 'kick.1', oid: 16, lengthSamples: 352_800, fileStartSamples: 88_200 }),
+  ]);
+  const [region] = parseAudioRegions(buffer);
+  assert.equal(region.name, 'kick.1');
+  assert.equal(region.oid, 16);
+  assert.equal(region.lengthSamples, 352_800);
+  assert.equal(region.fileStartSamples, 88_200);
+});
+
+test('arrangement units decode position, track and region ref', () => {
+  // bar 0 == ARRANGE_TICK_ORIGIN, which is NOT the 38400 origin MIDI uses.
+  const buffer = arrangeList([
+    { bar: 0, trackNumber: 1, trackRef: 88, regionRef: 8 },
+    { bar: 4, trackNumber: 2, trackRef: 92, regionRef: 16 },
+    { bar: 16, trackNumber: 3, trackRef: 96, regionRef: 24 },
+  ]);
+  const units = parseArrangeUnits(buffer);
+  assert.equal(units.length, 3);
+  assert.deepEqual(units.map((u) => u.positionTicks), [0, 4 * BAR_TICKS, 16 * BAR_TICKS]);
+  assert.deepEqual(units.map((u) => u.trackNumber), [1, 2, 3]);
+  assert.deepEqual(units.map((u) => u.regionRef), [8, 16, 24]);
+});
+
+test('clip gain reads as a signed decibel byte', () => {
+  const buffer = arrangeList([
+    { bar: 0, regionRef: 8, gainDb: 5 },
+    { bar: 4, regionRef: 8, gainDb: -3 },
+    { bar: 8, regionRef: 8 },
+  ]);
+  assert.deepEqual(parseArrangeUnits(buffer).map((u) => u.gainDb), [5, -3, 0]);
+});
+
+test('a unit with an implausible track number is rejected', () => {
+  const buffer = arrangeList([{ bar: 0, trackNumber: 200, regionRef: 8 }]);
+  assert.deepEqual(parseArrangeUnits(buffer, 16), []);
+});
+
+test('a unit with an out-of-range position is rejected', () => {
+  const buffer = arrangeList([{ bar: 0, regionRef: 8 }]);
+  buffer.writeUInt32LE(0xfffffff0, 36 + 4);
+  assert.deepEqual(parseArrangeUnits(buffer), []);
+});
+
+test('placement joins units to definitions on regionRef == oid', () => {
+  const buffer = Buffer.concat([
+    auRg({ name: 'drums', oid: 8, lengthSamples: 352_800 }),
+    auRg({ name: 'bass', oid: 16, lengthSamples: 705_600 }),
+    auRg({ name: 'never placed', oid: 99, lengthSamples: 100 }),
+    arrangeList([
+      { bar: 0, trackNumber: 1, trackRef: 88, regionRef: 8 },
+      { bar: 4, trackNumber: 2, trackRef: 92, regionRef: 16 },
+    ]),
+  ]);
+  const placed = placedAudioRegions(buffer);
+  assert.equal(placed.length, 2, 'the unplaced pool entry is not returned');
+  assert.deepEqual(placed[0], {
+    name: 'drums',
+    positionTicks: 0,
+    lengthSamples: 352_800,
+    fileStartSamples: 0,
+    trackRef: 88,
+    trackNumber: 1,
+    gainDb: 0,
+  });
+  assert.equal(placed[1].name, 'bass');
+});
+
+test('records are found even when they are not 4-byte aligned', () => {
+  // solace.logicx's first unit sits at offset 889245. A scan that steps by 4
+  // walks straight past every record in the file.
+  const buffer = Buffer.concat([
+    Buffer.alloc(3),
+    auRg({ name: 'drums', oid: 8, lengthSamples: 88_200 }),
+    Buffer.alloc(1),
+    arrangeList([{ bar: 2, trackNumber: 1, trackRef: 88, regionRef: 8 }]),
+  ]);
+  const placed = placedAudioRegions(buffer);
+  assert.equal(placed.length, 1);
+  assert.equal(placed[0].positionTicks, 2 * BAR_TICKS);
+});
+
+test('an interleaved foreign record costs one unit, not the whole list', () => {
+  const buffer = arrangeList(
+    [{ bar: 0, regionRef: 8 }, { bar: 4, regionRef: 16 }, { bar: 8, regionRef: 24 }],
+    { markerFor: (i) => (i === 1 ? 0x136db : 0x24) },
+  );
+  assert.deepEqual(parseArrangeUnits(buffer).map((u) => u.regionRef), [8, 24]);
+});
+
+test('a record with an implausible name length is skipped, not thrown on', () => {
+  const record = auRg({ name: 'ok', oid: 0 });
+  record.writeUInt16LE(60_000, 110);
+  assert.deepEqual(parseAudioRegions(record), []);
+});
