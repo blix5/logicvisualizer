@@ -3,16 +3,37 @@ import { isFailure } from '../shared/ipc';
 import type { ProjectModel } from '../shared/model';
 import { bpmAtBeat, buildBarGrid, buildTempoMap, secondsToBeats } from '../shared/timebase';
 import { PeakStore } from './audio/PeakStore';
-import { ArrangeRenderer, type RenderMode } from './render/ArrangeRenderer';
+import { TranscriptionStore } from './audio/TranscriptionStore';
+import { reduceBufferPeaks } from './audio/reducePeaks';
+import { ArrangeRenderer, type RenderMode, type StereoSpectrum } from './render/ArrangeRenderer';
+import { PianoRollRenderer } from './render/PianoRollRenderer';
 import type { PeakPyramid } from './render/peaks';
+import { buildRollScene } from './render/rollScene';
 import { buildScene } from './render/scene';
 import { AudioClock } from './transport/AudioClock';
 
 const LANE_CONFIG = { laneHeight: 44, laneGap: 4 };
 const MIN_PPS = 8;
 const MAX_PPS = 800;
-/** A region shorter than its source file by more than this is taken as trimmed. */
-const TRIM_TOLERANCE_SECONDS = 0.05;
+
+/** "Ab" + "major" -> "A♭ major". A flat or sharp only follows a note letter. */
+function formatKey(key: string | null, scale: 'major' | 'minor' | null): string {
+  if (!key) return 'key —';
+  const note = /^[A-G][b#]$/.test(key)
+    ? `${key[0]}${key[1] === 'b' ? '\u266d' : '\u266f'}`
+    : key;
+  return scale ? `${note} ${scale}` : note;
+}
+
+/**
+ * The project's time signature. Only the first is shown: meter CHANGES are read
+ * but their positions are not decoded yet (see buildProject), so a live readout
+ * would claim more than is known.
+ */
+function formatMeter(project: ProjectModel): string {
+  const sig = project.timeSignatures[0];
+  return sig ? `${sig.numerator}/${sig.denominator}` : '4/4';
+}
 
 function formatTime(seconds: number): string {
   const sign = seconds < 0 ? '-' : '';
@@ -35,6 +56,11 @@ export function App(): JSX.Element {
   const [playing, setPlaying] = useState(false);
   /** Bumped as peaks land, so the status bar re-renders. Not read per frame. */
   const [peaksVersion, setPeaksVersion] = useState(0);
+  /** Piano-roll display options. */
+  const [convertAudio, setConvertAudio] = useState(false);
+  const [showSpectrum, setShowSpectrum] = useState(false);
+  /** Bumped as transcriptions land, which rebuilds the roll scene. */
+  const [transcriptVersion, setTranscriptVersion] = useState(0);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -44,21 +70,39 @@ export function App(): JSX.Element {
   const positionRef = useRef<HTMLSpanElement | null>(null);
   const tempoRef = useRef<HTMLSpanElement | null>(null);
   const rendererRef = useRef<ArrangeRenderer | null>(null);
+  const rollRendererRef = useRef<PianoRollRenderer | null>(null);
+  /** The bounce's peaks, read by the frame loop; only the piano roll draws them. */
+  const bouncePeaksRef = useRef<PeakPyramid | null>(null);
+  /** Bumped per bounce import, so a slow reduction cannot land on a newer bounce. */
+  const bounceGenerationRef = useRef(0);
   const clockRef = useRef<AudioClock | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const peakStoreRef = useRef<PeakStore | null>(null);
+  const transcriptStoreRef = useRef<TranscriptionStore | null>(null);
+  /** Reused analyser read-outs for the stereo spectrum, left then right. */
+  const spectrumRef = useRef<{ left: Float32Array<ArrayBuffer>; right: Float32Array<ArrayBuffer> } | null>(null);
   const scrollTopRef = useRef(0);
   /** Bumped whenever something outside the frame key invalidates the canvas. */
   const dirtyRef = useRef(0);
   // The render loop reads these refs directly so it never depends on React
   // re-rendering at frame rate.
-  const viewRef = useRef({ pixelsPerSecond, mode, bounceOffset });
-  viewRef.current = { pixelsPerSecond, mode, bounceOffset };
+  const viewRef = useRef({ pixelsPerSecond, mode, bounceOffset, showSpectrum });
+  viewRef.current = { pixelsPerSecond, mode, bounceOffset, showSpectrum };
 
   const scene = useMemo(
     () => (project ? buildScene(project, LANE_CONFIG) : null),
     [project],
   );
+
+  const rollScene = useMemo(() => {
+    if (!project) return null;
+    void transcriptVersion;
+    const store = transcriptStoreRef.current;
+    return buildRollScene(
+      project,
+      convertAudio && store ? (audioFileId) => store.get(audioFileId) : undefined,
+    );
+  }, [project, convertAudio, transcriptVersion]);
 
   const tempoMap = useMemo(
     () => (project ? buildTempoMap(project.tempoEvents, project.baseBpm) : null),
@@ -82,6 +126,9 @@ export function App(): JSX.Element {
         dirtyRef.current += 1;
         setPeaksVersion((version) => version + 1);
       });
+      transcriptStoreRef.current = new TranscriptionStore(ctx, () => {
+        setTranscriptVersion((version) => version + 1);
+      });
     }
     return clockRef.current;
   }, []);
@@ -91,7 +138,29 @@ export function App(): JSX.Element {
     return entry && entry.state === 'ready' ? entry.pyramid : null;
   }, []);
 
-  useEffect(() => () => { peakStoreRef.current?.dispose(); }, []);
+  useEffect(() => () => {
+    peakStoreRef.current?.dispose();
+    transcriptStoreRef.current?.dispose();
+  }, []);
+
+  /** Hands the transcriber the files audible audio regions actually play. */
+  const queueTranscripts = useCallback((model: ProjectModel) => {
+    const store = transcriptStoreRef.current;
+    if (!store) return;
+    const audible = new Set(model.tracks.filter((track) => !track.muted).map((track) => track.id));
+    const used = new Set<string>();
+    for (const region of model.regions) {
+      if (region.kind === 'audio' && region.audioFileId && audible.has(region.trackId)) used.add(region.audioFileId);
+    }
+    store.setFiles(model.audioFiles.filter((file) => used.has(file.id)));
+  }, []);
+
+  // Transcription is expensive, so it only starts once the option is used.
+  useEffect(() => {
+    if (!convertAudio || !project) return;
+    ensureClock();
+    transcriptStoreRef.current?.start();
+  }, [convertAudio, project, ensureClock]);
 
   const openProject = useCallback(async () => {
     const picked = await window.lv.project.pick();
@@ -105,8 +174,9 @@ export function App(): JSX.Element {
     scrollTopRef.current = 0;
     ensureClock().seek(0);
     peakStoreRef.current?.load(result.audioFiles);
+    queueTranscripts(result);
     setStatus(`Loaded ${result.projectName}`);
-  }, [ensureClock]);
+  }, [ensureClock, queueTranscripts]);
 
   const reloadProject = useCallback(async () => {
     if (!project) return;
@@ -117,8 +187,9 @@ export function App(): JSX.Element {
     setProject(result);
     ensureClock();
     peakStoreRef.current?.load(result.audioFiles);
+    queueTranscripts(result);
     setStatus(`Reloaded at ${new Date().toLocaleTimeString()}`);
-  }, [project, ensureClock]);
+  }, [project, ensureClock, queueTranscripts]);
 
   const openBounce = useCallback(async () => {
     const picked = await window.lv.bounce.pick();
@@ -132,7 +203,18 @@ export function App(): JSX.Element {
     try {
       const buffer = await ctx.decodeAudioData(result.bytes);
       clock.setBuffer(buffer);
+      bouncePeaksRef.current = null;
+      bounceGenerationRef.current += 1;
+      const generation = bounceGenerationRef.current;
+      dirtyRef.current += 1;
       setBounceName(result.name);
+      // Reduced off the main thread; the strip fills in when it lands. A later
+      // import may have replaced this bounce by then.
+      void reduceBufferPeaks(buffer).then((pyramid) => {
+        if (generation !== bounceGenerationRef.current) return;
+        bouncePeaksRef.current = pyramid;
+        dirtyRef.current += 1;
+      }).catch(() => { /* the roll just shows no bounce waveform */ });
       setStatus(`Bounce: ${result.name} (${buffer.duration.toFixed(1)}s)`);
     } catch (decodeError) {
       setError(`Could not decode ${result.name}: ${(decodeError as Error).message}`);
@@ -147,9 +229,12 @@ export function App(): JSX.Element {
     const stage = stageRef.current;
     if (!canvas || !stage) return;
     rendererRef.current = new ArrangeRenderer(canvas);
+    rollRendererRef.current = new PianoRollRenderer(canvas);
     const resize = () => {
       const rect = stage.getBoundingClientRect();
-      rendererRef.current?.resize(rect.width, rect.height, window.devicePixelRatio || 1);
+      const dpr = window.devicePixelRatio || 1;
+      rendererRef.current?.resize(rect.width, rect.height, dpr);
+      rollRendererRef.current?.resize(rect.width, rect.height, dpr);
       dirtyRef.current += 1;
     };
     resize();
@@ -164,6 +249,8 @@ export function App(): JSX.Element {
     let lastKey = '';
     let lastLabel = '';
     let lastTempo = '';
+    let lastSounding = 0;
+    let spectrumFrame = 0;
     const tick = () => {
       frame = requestAnimationFrame(tick);
       const renderer = rendererRef.current;
@@ -174,21 +261,49 @@ export function App(): JSX.Element {
       const media = clock ? clock.now() : 0;
       const projectSeconds = media - view.bounceOffset;
 
+      // The spectrum moves with the audio, not the playhead, so while it is on
+      // every frame draws — during playback and for a moment after, while the
+      // analyser's smoothing decays to silence.
+      let spectrum: StereoSpectrum | null = null;
+      if (view.showSpectrum && view.mode === 'roll' && clock) {
+        const now = performance.now();
+        if (clock.isPlaying) lastSounding = now;
+        if (now - lastSounding < 1500) {
+          const bins = clock.analyserLeft.frequencyBinCount;
+          let buffers = spectrumRef.current;
+          if (!buffers || buffers.left.length !== bins) {
+            buffers = { left: new Float32Array(bins), right: new Float32Array(bins) };
+            spectrumRef.current = buffers;
+          }
+          clock.analyserLeft.getFloatFrequencyData(buffers.left);
+          clock.analyserRight.getFloatFrequencyData(buffers.right);
+          spectrum = { ...buffers, sampleRate: clock.analyserLeft.context.sampleRate };
+          spectrumFrame += 1;
+        }
+      }
+
       // Nothing on screen depends on time beyond where it puts the content, so
       // a paused, untouched view costs nothing. Quarter-pixel granularity is
       // below what the canvas can show.
       const key = `${Math.round(projectSeconds * view.pixelsPerSecond * 4)}|`
-        + `${Math.round(scrollTopRef.current)}|${view.pixelsPerSecond}|${view.mode}|${dirtyRef.current}`;
+        + `${Math.round(scrollTopRef.current)}|${view.pixelsPerSecond}|${view.mode}|`
+        + `${view.bounceOffset}|${view.showSpectrum}|${spectrum ? spectrumFrame : 0}|${dirtyRef.current}`;
       if (key !== lastKey) {
         lastKey = key;
-        renderer.draw(scene, {
+        const state = {
           pixelsPerSecond: view.pixelsPerSecond,
           playheadSeconds: projectSeconds,
           scrollTop: scrollTopRef.current,
           mode: view.mode,
           barGrid,
           peaks: peaksLookup,
-        });
+          bouncePeaks: bouncePeaksRef.current,
+          bounceOffset: view.bounceOffset,
+          spectrum,
+        };
+        const roll = rollRendererRef.current;
+        if (view.mode === 'roll' && roll && rollScene) roll.draw(rollScene, state);
+        else renderer.draw(scene, state);
       }
 
       const label = formatTime(projectSeconds);
@@ -207,7 +322,7 @@ export function App(): JSX.Element {
     };
     frame = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frame);
-  }, [scene, barGrid, tempoMap, peaksLookup]);
+  }, [scene, rollScene, barGrid, tempoMap, peaksLookup]);
 
   const togglePlay = useCallback(() => {
     const clock = ensureClock();
@@ -244,6 +359,8 @@ export function App(): JSX.Element {
         if (clock) clock.seek(clock.now() + event.deltaX / viewRef.current.pixelsPerSecond);
         return;
       }
+      // The piano roll is locked vertically.
+      if (viewRef.current.mode === 'roll') return;
       const height = scene?.contentHeight ?? 0;
       scrollTopRef.current = Math.max(0, Math.min(height, scrollTopRef.current + event.deltaY));
     };
@@ -251,26 +368,27 @@ export function App(): JSX.Element {
     return () => stage.removeEventListener('wheel', onWheel);
   }, [scene]);
 
-  // Source duration is only known after decode, so the trim check lives here
-  // rather than in buildProject.
+  // Waveform loading progress, and regions whose source file could not be read.
   const audioStatus = useMemo(() => {
     void peaksVersion;
     const store = peakStoreRef.current;
     if (!project || !store) return null;
     const { done, total } = store.progress;
-    let trimmed = 0;
     let unresolved = 0;
     for (const region of project.regions) {
       if (region.kind !== 'audio') continue;
       if (!region.audioFileId) { unresolved += 1; continue; }
       const entry = store.get(region.audioFileId);
       if (!entry || entry.state === 'pending') continue;
-      if (entry.state === 'failed') { unresolved += 1; continue; }
-      const regionSeconds = region.endSeconds - region.startSeconds;
-      if (entry.pyramid.durationSeconds > regionSeconds + TRIM_TOLERANCE_SECONDS) trimmed += 1;
+      if (entry.state === 'failed') unresolved += 1;
     }
-    return { done, total, trimmed, unresolved };
+    return { done, total, unresolved };
   }, [project, peaksVersion]);
+
+  const transcriptStatus = useMemo(() => {
+    void transcriptVersion;
+    return transcriptStoreRef.current?.progress ?? null;
+  }, [transcriptVersion]);
 
   const stats = useMemo(() => {
     if (!project) return null;
@@ -299,6 +417,13 @@ export function App(): JSX.Element {
         <span className="readout tempo" ref={tempoRef}>
           {project ? `${project.baseBpm} BPM` : '— BPM'}
         </span>
+        {project && (
+          <span className="readout" title="Key and time signature">
+            {formatKey(project.songKey, project.songScale)}
+            {' · '}
+            {formatMeter(project)}
+          </span>
+        )}
 
         <label className="field">
           offset
@@ -333,6 +458,25 @@ export function App(): JSX.Element {
           className={mode === 'stylized' ? 'active' : ''}
           onClick={() => setMode('stylized')}
         >Stylized</button>
+        <button
+          className={mode === 'roll' ? 'active' : ''}
+          onClick={() => setMode('roll')}
+        >Piano roll</button>
+        {mode === 'roll' && (
+          <>
+            <button
+              className={convertAudio ? 'active' : ''}
+              onClick={() => setConvertAudio((on) => !on)}
+              disabled={!project}
+              title="Show audio as its waveform, shifted to its detected pitch (display only)"
+            >Audio→MIDI</button>
+            <button
+              className={showSpectrum ? 'active' : ''}
+              onClick={() => setShowSpectrum((on) => !on)}
+              title="Faint live stereo spectrum of the bounce: left from the bottom, right from the top"
+            >Spectrum</button>
+          </>
+        )}
       </div>
 
       <div className="stage" ref={stageRef}>
@@ -363,14 +507,11 @@ export function App(): JSX.Element {
             {!project.capabilities.audioRegionTracks && project.capabilities.audioRegions && (
               <span className="warn">audio track assignment not yet decoded — audio is on one lane</span>
             )}
+            {convertAudio && transcriptStatus && transcriptStatus.done < transcriptStatus.total && (
+              <span>transcribing audio… {transcriptStatus.done}/{transcriptStatus.total}</span>
+            )}
             {audioStatus && audioStatus.done < audioStatus.total && (
               <span>reading waveforms… {audioStatus.done}/{audioStatus.total}</span>
-            )}
-            {audioStatus && audioStatus.trimmed > 0 && (
-              <span className="warn">
-                {audioStatus.trimmed} audio {audioStatus.trimmed === 1 ? 'region is' : 'regions are'} trimmed
-                {' '}— waveform phase is approximate until the file offset is decoded
-              </span>
             )}
             {audioStatus && audioStatus.unresolved > 0 && (
               <span className="warn">

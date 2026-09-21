@@ -17,6 +17,7 @@
 import type { AudioRegionModel, RegionModel } from '../../shared/model';
 import type { BarGridEntry } from '../../shared/timebase';
 import { levelForPixelsPerSecond, peakCount, type PeakPyramid } from './peaks';
+import { RectBuffer } from './rectBuffer';
 import {
   NOTE_FIELDS,
   VELOCITY_BUCKETS,
@@ -27,7 +28,10 @@ import {
   type Scene,
 } from './scene';
 
-export type RenderMode = 'arrange' | 'stylized';
+export type RenderMode = 'arrange' | 'stylized' | 'roll';
+
+/** dB per FFT bin for each channel of the bounce, as AnalyserNode reports it. */
+export type StereoSpectrum = { left: Float32Array; right: Float32Array; sampleRate: number };
 
 export type ViewState = {
   pixelsPerSecond: number;
@@ -41,6 +45,12 @@ export type ViewState = {
    * peaks arrive asynchronously while the scene is built once per project.
    */
   peaks: (audioFileId: string) => PeakPyramid | null;
+  /** The bounced mixdown's peaks, once reduced. Only the piano roll draws it. */
+  bouncePeaks?: PeakPyramid | null;
+  /** Bounce seconds minus project seconds; places the bounce on the timeline. */
+  bounceOffset?: number;
+  /** Live analyser output per channel, for the piano roll's spectrum lines. */
+  spectrum?: StereoSpectrum | null;
 };
 
 const LANE_LABEL_WIDTH = 168;
@@ -53,40 +63,9 @@ const MAX_BLURRED_FLASHES = 48;
 /** Clamp margin for fills whose paint spreads beyond the rect. */
 const EDGE_MARGIN = GLOW_PAD + 8;
 
-function withAlpha(color: string, alpha: number): string {
+export function withAlpha(color: string, alpha: number): string {
   // Track colours are hsl(...) strings; hsl() accepts a slash-alpha suffix.
   return color.startsWith('hsl(') ? `${color.slice(0, -1)} / ${alpha})` : color;
-}
-
-/** Reusable x/y/w/h store, so batching notes costs no allocation per frame. */
-class RectBuffer {
-  private data = new Float32Array(4 * 256);
-  private count = 0;
-
-  reset(): void { this.count = 0; }
-  get size(): number { return this.count; }
-
-  push(x: number, y: number, w: number, h: number): void {
-    const at = this.count * 4;
-    if (at + 4 > this.data.length) {
-      const grown = new Float32Array(this.data.length * 2);
-      grown.set(this.data);
-      this.data = grown;
-    }
-    this.data[at] = x;
-    this.data[at + 1] = y;
-    this.data[at + 2] = w;
-    this.data[at + 3] = h;
-    this.count += 1;
-  }
-
-  /** Caller sets fillStyle once; every rect here shares it. */
-  fillInto(ctx: CanvasRenderingContext2D): void {
-    for (let i = 0; i < this.count; i += 1) {
-      const o = i * 4;
-      ctx.fillRect(this.data[o]!, this.data[o + 1]!, this.data[o + 2]!, this.data[o + 3]!);
-    }
-  }
 }
 
 export class ArrangeRenderer {
@@ -158,7 +137,7 @@ export class ArrangeRenderer {
     const width = this.canvas.width / this.dpr;
     const height = this.canvas.height / this.dpr;
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    this.ctx.fillStyle = mode === 'stylized' ? '#05060a' : '#0b0d12';
+    this.ctx.fillStyle = mode === 'arrange' ? '#0b0d12' : '#05060a';
     this.ctx.fillRect(0, 0, width, height);
   }
 
@@ -357,6 +336,9 @@ export class ArrangeRenderer {
     const level = levelForPixelsPerSecond(pyramid, view.pixelsPerSecond);
     const data = pyramid.levels[level];
     const rate = pyramid.rates[level] ?? 0;
+    // Seconds of source audio per timeline second; not to be confused with
+    // `rate` above, which is the pyramid's buckets per second.
+    const sourceRate = region.sourceRate > 0 ? region.sourceRate : 1;
     const buckets = peakCount(pyramid, level);
     if (!data || rate <= 0 || buckets === 0) return;
 
@@ -369,11 +351,12 @@ export class ArrangeRenderer {
     const right = Math.min(fillX + fillW, endX);
 
     for (let x = left; x < right; x += 1) {
-      // The region's audio begins fileStartSeconds into the source file. That is
-      // 0 for every region today because the trim offset is not decoded yet, but
-      // writing it this way means trimmed regions come right the moment it is.
-      const from = (x - startX) * secondsPerPixel + region.fileStartSeconds;
-      const to = (x + 1 - startX) * secondsPerPixel + region.fileStartSeconds;
+      // Timeline seconds map to SOURCE seconds via the trim-in and the flex
+      // stretch: a flexed region consumes sourceRate seconds of audio per second
+      // of timeline. Ignoring the rate truncates or overruns a stretched
+      // region's waveform.
+      const from = (x - startX) * secondsPerPixel * sourceRate + region.fileStartSeconds;
+      const to = (x + 1 - startX) * secondsPerPixel * sourceRate + region.fileStartSeconds;
       let first = Math.floor(from * rate);
       let last = Math.ceil(to * rate);
       if (last <= first) last = first + 1;

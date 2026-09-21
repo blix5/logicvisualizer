@@ -50,6 +50,15 @@ export type AudioRegionModel = RegionBase & {
   fileStartSeconds: number;
   /** Clip gain in decibels, from the region inspector. */
   gainDb: number;
+  /** Flex on in Logic. */
+  flex: boolean;
+  /**
+   * Seconds of SOURCE audio consumed per second of timeline. 1 for an
+   * unstretched region; below 1 when Flex slows a loop down to fit, above 1
+   * when it speeds one up. The waveform must be scaled by this or a stretched
+   * region's waveform stops short of (or overruns) the region.
+   */
+  sourceRate: number;
   /**
    * Position and track are decoded from the arrangement sequence. The region's
    * LENGTH is not: see logicAudio.ts. When true, endSeconds is an estimate from
@@ -101,6 +110,8 @@ export type ProjectModel = {
   baseBpm: number;
   sampleRate: number;
   songKey: string | null;
+  /** 'major' or 'minor', from MetaData.plist SongGenderKey. */
+  songScale: 'major' | 'minor' | null;
   tempoEvents: TempoEvent[];
   timeSignatures: TimeSignature[];
 

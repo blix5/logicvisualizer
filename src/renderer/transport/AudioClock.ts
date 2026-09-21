@@ -17,6 +17,16 @@ export type ClockState = {
 
 export class AudioClock {
   private readonly ctx: AudioContext;
+  /**
+   * One analyser per channel, fed from a splitter off the bounce, for the piano
+   * roll's stereo spectrum. They tap the signal rather than sit in its path;
+   * an AnalyserNode is pulled by the audio graph without reaching the
+   * destination, and an idle one costs nothing until it is read.
+   */
+  readonly analyserLeft: AnalyserNode;
+  readonly analyserRight: AnalyserNode;
+  /** Where the bounce enters the analysis branch; see the constructor. */
+  private readonly analysisInput: GainNode;
   private buffer: AudioBuffer | null = null;
   private source: AudioBufferSourceNode | null = null;
   private anchorCtxTime = 0;
@@ -29,6 +39,27 @@ export class AudioClock {
 
   constructor(ctx: AudioContext) {
     this.ctx = ctx;
+    // A splitter's channel interpretation is fixed at 'discrete', which would
+    // put a mono bounce in the left analyser only. A unity gain forced to two
+    // channels with 'speakers' interpretation up-mixes mono into both first.
+    this.analysisInput = ctx.createGain();
+    this.analysisInput.channelCount = 2;
+    this.analysisInput.channelCountMode = 'explicit';
+    this.analysisInput.channelInterpretation = 'speakers';
+    const splitter = ctx.createChannelSplitter(2);
+    this.analysisInput.connect(splitter);
+    const make = () => {
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 4096;
+      analyser.smoothingTimeConstant = 0.8;
+      analyser.minDecibels = -95;
+      analyser.maxDecibels = -15;
+      return analyser;
+    };
+    this.analyserLeft = make();
+    this.analyserRight = make();
+    splitter.connect(this.analyserLeft, 0);
+    splitter.connect(this.analyserRight, 1);
   }
 
   setBuffer(buffer: AudioBuffer | null): void {
@@ -63,6 +94,7 @@ export class AudioClock {
       source.buffer = this.buffer;
       source.playbackRate.value = this.rate;
       source.connect(this.ctx.destination);
+      source.connect(this.analysisInput);
       source.start(when, Math.max(0, from));
       this.source = source;
     }

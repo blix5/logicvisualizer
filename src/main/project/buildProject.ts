@@ -41,6 +41,7 @@ import type {
 } from '../../shared/model';
 import { NOTE_STRIDE } from '../../shared/model';
 import { fallbackTrackColor } from './palette';
+import { flexedBeats, readFileTempo } from '../audio/fileTempo';
 
 const DEFAULT_BPM = 120;
 const DEFAULT_SAMPLE_RATE = 44100;
@@ -248,35 +249,29 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
     });
   }
 
-  // Audio regions. Position and track come from the arrangement units, length
-  // from the joined region definition. The source file is resolved by name,
-  // since a region's name is its file's basename plus an optional take suffix.
-  const filesByBasename = new Map<string, AudioFileModel>();
-  for (const file of audioFiles) {
-    const base = file.fileName.replace(/\.[a-z0-9]+$/i, '');
-    if (!filesByBasename.has(base)) filesByBasename.set(base, file);
-  }
-
-  /**
-   * A region's name is its file's basename plus, usually, a take suffix. Two
-   * transforms cover the rest: Logic strips the take number before a stem
-   * qualifier, and writes stem qualifiers parenthesised where the file on disk
-   * uses an underscore ("blue (Vocals)" against blue_Vocals.wav).
-   */
-  function resolveAudioFile(regionName: string): AudioFileModel | null {
-    const withoutTake = regionName.replace(/\.\d+(?=\s*\(|$)/, '');
-    const candidates = [
-      regionName,
-      withoutTake,
-      withoutTake.replace(/\s*\(([^)]+)\)\s*$/, '_$1'),
-    ];
-    for (const candidate of candidates) {
-      const match = filesByBasename.get(candidate);
-      if (match) return match;
-    }
-    return null;
-  }
+  // Audio regions. Position and track come from the arrangement units; length,
+  // trim-in and the source file come from the joined region definition. The
+  // file is resolved by POINTER (AuRg +10 is the file's oid), never by name:
+  // name matching picked the wrong file for 102 regions across ~/Music/Logic,
+  // where a take suffix like "X.10" collided with a separate "X.1.wav" -- and
+  // drew a waveform from a file of a different length, which ran out partway.
   const placed = placedAudioRegions(buffer, maxTrackNumber);
+
+  // Flex regions are stretched to follow project tempo, and the stretched length
+  // is NOT stored in the project (see fileTempo.ts). It is recovered from the
+  // audio file's own tempo, read once per file.
+  const absolutePathByFileId = new Map(audioFiles.map((file) => [file.id, file.absolutePath]));
+  const tempoByFileId = new Map<string, number | null>();
+  function fileTempo(fileId: string | null): number | null {
+    if (!fileId) return null;
+    if (!tempoByFileId.has(fileId)) {
+      const filePath = absolutePathByFileId.get(fileId);
+      tempoByFileId.set(fileId, filePath ? readFileTempo(filePath) : null);
+    }
+    return tempoByFileId.get(fileId) ?? null;
+  }
+  let stretchedCount = 0;
+  let flexUnresolved = 0;
 
   for (const region of placed) {
     const trackId = trackIdFor(region.trackRef, region.trackNumber - 1);
@@ -285,7 +280,28 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
 
     const startBeat = region.positionTicks / LOGIC_PPQ;
     const startSeconds = beatsToSeconds(tempoMap, startBeat);
-    const endSecondsForRegion = startSeconds + region.lengthSamples / sampleRate;
+    const audioFileId = audioFileIdByOid.get(region.fileOid) ?? null;
+    const nativeSeconds = region.lengthSamples / sampleRate;
+
+    // Unstretched: the timeline length IS the audio length. Flexed: the audio
+    // holds a whole number of beats, which play at project tempo, so the
+    // timeline length comes from the tempo map and the audio is squeezed or
+    // stretched to fit. A flex region whose file declares no tempo stays at its
+    // native length -- Logic cannot stretch audio it has no tempo for either.
+    let endSecondsForRegion = startSeconds + nativeSeconds;
+    let sourceRate = 1;
+    if (region.flex) {
+      const tempo = fileTempo(audioFileId);
+      const beats = tempo !== null ? flexedBeats(nativeSeconds, tempo) : null;
+      if (beats !== null) {
+        endSecondsForRegion = beatsToSeconds(tempoMap, startBeat + beats);
+        const timelineSeconds = endSecondsForRegion - startSeconds;
+        if (timelineSeconds > 0) sourceRate = nativeSeconds / timelineSeconds;
+        stretchedCount += 1;
+      } else {
+        flexUnresolved += 1;
+      }
+    }
 
     regions.push({
       kind: 'audio',
@@ -298,11 +314,24 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
       lengthBeats: secondsToBeats(tempoMap, endSecondsForRegion) - startBeat,
       startSeconds,
       endSeconds: endSecondsForRegion,
-      audioFileId: resolveAudioFile(region.name)?.id ?? null,
+      audioFileId,
+      // Trim-in is decoded (AuRg +42, re_probe7) and exact for every trimmed
+      // region in ~/Music/Logic, all of which use files at the project's sample
+      // rate. For a file at a DIFFERENT rate it is unverified whether Logic
+      // counts these samples at the file's rate or the project's; this assumes
+      // the project's.
       fileStartSeconds: region.fileStartSamples / sampleRate,
       gainDb: region.gainDb,
+      flex: region.flex,
+      sourceRate,
       lengthApproximate: false,
     });
+  }
+  if (stretchedCount > 0 || flexUnresolved > 0) {
+    warnings.push(
+      `Flex: ${stretchedCount} stretched`
+      + (flexUnresolved > 0 ? `, ${flexUnresolved} at native length (no file tempo)` : ''),
+    );
   }
 
   // ---- markers -----------------------------------------------------------
@@ -336,6 +365,10 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
     baseBpm,
     sampleRate,
     songKey: readString(metadata, 'SongKey'),
+    songScale: (() => {
+      const scale = readString(metadata, 'SongGenderKey')?.toLowerCase();
+      return scale === 'major' || scale === 'minor' ? scale : null;
+    })(),
     tempoEvents,
     timeSignatures,
     tracks,

@@ -18,10 +18,11 @@ function auFl(fileName) {
   return record;
 }
 
-function auRg({ name, oid, lengthSamples = 88_200, fileStartSamples = 0 }) {
+function auRg({ name, oid, ordinal = 0, lengthSamples = 88_200, fileStartSamples = 0 }) {
   const record = Buffer.alloc(300);
   record.write('gRuA', 0, 'ascii');
   record.writeUInt32LE(oid, 10);
+  record.writeUInt16LE(ordinal, 14);
   record.writeUInt32LE(fileStartSamples, 42);
   record.writeUInt32LE(lengthSamples, 58);
   record.writeUInt16LE(name.length, 110);
@@ -39,9 +40,12 @@ function arrangeList(units, { markerFor = () => 0x24 } = {}) {
     const at = 36 + i * 80;
     chunk.writeUInt32LE(markerFor(i), at);
     chunk.writeUInt32LE(ARRANGE_TICK_ORIGIN + unit.bar * BAR_TICKS, at + 4);
+    chunk.writeUInt16LE(unit.subtick ?? 0, at + 2);
     chunk.writeUInt32LE(unit.trackRef ?? 88, at + 16);
     chunk.writeUInt8(unit.trackNumber ?? 1, at + 20);
+    chunk.writeUInt32LE(unit.ordinal ?? 0, at + 40);
     chunk.writeUInt32LE(unit.regionRef, at + 44);
+    chunk.writeUInt8(unit.flex ? 0x97 : 0x17, at + 48);
     chunk.writeInt8(unit.gainDb ?? 0, at + 52);
   });
   return chunk;
@@ -79,6 +83,73 @@ test('arrangement units decode position, track and region ref', () => {
   assert.deepEqual(units.map((u) => u.regionRef), [8, 16, 24]);
 });
 
+test('the region oid is a pointer to its source file', () => {
+  // AuRg +10 equals 4 x the AuFl index. Resolving by NAME instead picked the
+  // wrong file for 102 regions in ~/Music/Logic: a take suffix like "X.10"
+  // collided with a separate "X.1.wav", and the waveform came from a file of a
+  // different length and ran out partway through the region.
+  const buffer = Buffer.concat([
+    auFl('take.wav'),
+    auFl('take.1.wav'),
+    auRg({ name: 'take.10', oid: 4, lengthSamples: 717_559 }),
+    arrangeList([{ bar: 0, regionRef: 4 }]),
+  ]);
+  const files = parseAudioFiles(buffer);
+  const [region] = placedAudioRegions(buffer);
+  const file = files.find((f) => f.oid === region.fileOid);
+  assert.equal(file.fileName, 'take.1.wav', 'the pointer wins over the name');
+});
+
+test('the ordinal picks the right record when several share an oid', () => {
+  // Logic gives a region and its copies one oid; they differ in trim and
+  // length. djpubichair.logicx has eleven records under oid 168, ten untrimmed
+  // and one trimmed -- joining on the oid alone rendered the untrimmed sibling.
+  const buffer = Buffer.concat([
+    auRg({ name: 'full', oid: 168, ordinal: 0, lengthSamples: 717_559, fileStartSamples: 0 }),
+    auRg({ name: 'trimmed', oid: 168, ordinal: 9, lengthSamples: 269_085, fileStartSamples: 89_695 }),
+    arrangeList([
+      { bar: 0, regionRef: 168, ordinal: 0 },
+      { bar: 8, regionRef: 168, ordinal: 9 },
+    ]),
+  ]);
+  const placed = placedAudioRegions(buffer);
+  assert.equal(placed.length, 2);
+  assert.deepEqual(placed.map((r) => r.name), ['full', 'trimmed']);
+  assert.equal(placed[1].lengthSamples, 269_085);
+  assert.equal(placed[1].fileStartSamples, 89_695);
+});
+
+test('an unknown ordinal falls back to the oid rather than dropping the region', () => {
+  const buffer = Buffer.concat([
+    auRg({ name: 'only', oid: 40, ordinal: 0, lengthSamples: 12_345 }),
+    arrangeList([{ bar: 0, regionRef: 40, ordinal: 7 }]),
+  ]);
+  const placed = placedAudioRegions(buffer);
+  assert.equal(placed.length, 1);
+  assert.equal(placed[0].lengthSamples, 12_345);
+});
+
+test('off-grid placements are found, with a sub-tick position', () => {
+  // Bytes +2..3 hold a fraction of a tick for regions dropped between ticks.
+  // Matching the marker as a u32 required them to be zero and silently dropped
+  // every unsnapped region -- 1,402 of them across ~/Music/Logic.
+  const buffer = arrangeList([
+    { bar: 0, regionRef: 8 },
+    { bar: 4, regionRef: 8, subtick: 0x8000 },
+  ]);
+  const units = parseArrangeUnits(buffer);
+  assert.equal(units.length, 2, 'the off-grid unit is not dropped');
+  assert.equal(units[1].positionTicks, 4 * BAR_TICKS + 0.5);
+});
+
+test('the flex flag is bit 7 of placement byte +48', () => {
+  const buffer = arrangeList([
+    { bar: 0, regionRef: 8, flex: true },
+    { bar: 4, regionRef: 8, flex: false },
+  ]);
+  assert.deepEqual(parseArrangeUnits(buffer).map((u) => u.flex), [true, false]);
+});
+
 test('clip gain reads as a signed decibel byte', () => {
   const buffer = arrangeList([
     { bar: 0, regionRef: 8, gainDb: 5 },
@@ -113,12 +184,14 @@ test('placement joins units to definitions on regionRef == oid', () => {
   assert.equal(placed.length, 2, 'the unplaced pool entry is not returned');
   assert.deepEqual(placed[0], {
     name: 'drums',
+    fileOid: 8,
     positionTicks: 0,
     lengthSamples: 352_800,
     fileStartSamples: 0,
     trackRef: 88,
     trackNumber: 1,
     gainDb: 0,
+    flex: false,
   });
   assert.equal(placed[1].name, 'bass');
 });

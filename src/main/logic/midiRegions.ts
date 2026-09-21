@@ -89,8 +89,10 @@ const MAX_PLAUSIBLE_LENGTH_TICKS = 400 * 4 * LOGIC_PPQ;
  */
 export function parseMidiPlacements(buffer: Buffer, maxTrackNumber: number): MidiPlacement[] {
   const placements: MidiPlacement[] = [];
-  const marker = Buffer.alloc(4);
-  marker.writeUInt32LE(PLACEMENT_MARKER, 0);
+  // u16, as for audio: bytes +2..3 carry a sub-tick fraction for off-grid
+  // placements, so a u32 match would drop every unsnapped region.
+  const marker = Buffer.alloc(2);
+  marker.writeUInt16LE(PLACEMENT_MARKER, 0);
   let from = 0;
   while (from < buffer.length) {
     const at = buffer.indexOf(marker, from);
@@ -109,7 +111,7 @@ export function parseMidiPlacements(buffer: Buffer, maxTrackNumber: number): Mid
     if (buffer.readUInt32LE(at + 32) !== regionRef) continue;
 
     placements.push({
-      positionTicks: rawPosition - ARRANGE_TICK_ORIGIN,
+      positionTicks: rawPosition - ARRANGE_TICK_ORIGIN + buffer.readUInt16LE(at + 2) / 65536,
       trackRef: buffer.readUInt32LE(at + PLACEMENT_TRACK_REF_OFFSET),
       trackNumber,
       regionRef,
@@ -139,6 +141,32 @@ function readNoteBlockLength(buffer: Buffer, qSveOffset: number): number | null 
 
 function ticksFromOrigin(raw: number): number {
   return raw >= LOGIC_BAR1_TICK_ORIGIN ? raw - LOGIC_BAR1_TICK_ORIGIN : raw;
+}
+
+/**
+ * Clips notes to a region's own span, the way Logic sounds them.
+ *
+ * A note block is the region's full CONTENT, which can be longer than the
+ * region: trimming a region's end leaves the trimmed-off notes in the block.
+ * 194 of the 2,047 MIDI regions in ~/Music/Logic have notes running past their
+ * end, by up to 10 bars — those were all being drawn.
+ *
+ * Only the end is clipped. Nothing in the corpus starts before its region
+ * (minimum note start is never negative), and no cell field matches the first
+ * note's offset, so notes that begin late are genuine rests rather than a
+ * start-trim that would need shifting.
+ */
+function clipNotesToRegion(notes: LogicNote[], lengthTicks: number): LogicNote[] {
+  if (lengthTicks <= 0) return notes;
+  const clipped: LogicNote[] = [];
+  for (const note of notes) {
+    if (note.startTicks >= lengthTicks) continue;
+    const available = lengthTicks - note.startTicks;
+    clipped.push(note.durationTicks <= available
+      ? note
+      : { ...note, durationTicks: available });
+  }
+  return clipped;
 }
 
 /** Walks one qSvE payload at 16-byte granularity, collecting 32-byte note records. */
@@ -195,7 +223,7 @@ export function parseMidiRegions(buffer: Buffer, maxTrackNumber: number): Parsed
       trackNumber: placement.trackNumber,
       positionTicks: placement.positionTicks,
       lengthTicks: cell.lengthTicks,
-      notes: readRegionNotes(buffer, cell.qsve),
+      notes: clipNotesToRegion(readRegionNotes(buffer, cell.qsve), cell.lengthTicks),
     });
   }
   return regions;

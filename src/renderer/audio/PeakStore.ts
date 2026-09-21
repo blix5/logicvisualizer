@@ -7,10 +7,10 @@
 // The queue is strictly serial. A five-minute 24-bit stereo file decodes to about
 // 105 MB of Float32; running a project's worth of them at once would exhaust
 // memory long before it finished.
-import { isFailure } from '../../shared/ipc';
 import type { AudioFileModel } from '../../shared/model';
 import { buildPeakPyramid, type PeakPyramid } from '../render/peaks';
 import type { PeaksRequest, PeaksResponse } from '../render/peaksProtocol';
+import { decodeAudioFile } from './decode';
 import PeaksWorker from '../render/peaksWorker?worker&inline';
 
 export type PeakEntry =
@@ -119,23 +119,8 @@ export class PeakStore {
     const filePath = file.absolutePath;
     if (!filePath) return;
     try {
-      const result = await window.lv.audio.read(filePath);
+      const { channels, sampleRate } = await decodeAudioFile(this.ctx, filePath);
       if (generation !== this.generation) return;
-      if (isFailure(result)) throw new Error(result.error);
-
-      // decodeAudioData detaches the ArrayBuffer it is given; nothing may use
-      // result.bytes after this point.
-      let decoded: AudioBuffer | null = await this.ctx.decodeAudioData(result.bytes);
-      if (generation !== this.generation) return;
-
-      const sampleRate = decoded.sampleRate;
-      const channels: Float32Array[] = [];
-      for (let channel = 0; channel < decoded.numberOfChannels; channel += 1) {
-        channels.push(decoded.getChannelData(channel).slice());
-      }
-      // Drop the AudioBuffer before the reduction so the copies and the original
-      // are not both resident while the worker runs.
-      decoded = null;
 
       const pyramid = await this.reduce(channels, sampleRate);
       if (generation !== this.generation) return;
