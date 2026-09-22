@@ -40,6 +40,12 @@ export type SpectrumLayout = {
   /** Top of each pitch row, indexed by MIDI pitch. */
   pitchY: Float32Array;
   rowHeight: number;
+  /**
+   * The whole canvas. Every view spans it — under the toolbar and through the
+   * bounce band — rather than stopping at the pitch rows; the pitch-aligned
+   * views extend the roll's pitch axis past both ends to do so.
+   */
+  canvasHeight: number;
   pixelsPerSecond: number;
   playheadSeconds: number;
   /** True while audio plays; the trail records only then. */
@@ -73,8 +79,55 @@ const TRAIL_FLOOR = 0.3;
 /** A jump larger than this starts a new run rather than smearing one column. */
 const TRAIL_MAX_FILL = TRAIL_RATE;
 
-const LEFT_TINT = { line: 'rgba(170,205,255,0.26)', fill: 'rgba(140,180,255,0.035)', bar: 'rgba(150,190,255,0.10)', cap: 'rgba(185,212,255,0.4)' };
-const RIGHT_TINT = { line: 'rgba(255,190,215,0.24)', fill: 'rgba(255,160,200,0.03)', bar: 'rgba(255,170,205,0.09)', cap: 'rgba(255,198,222,0.36)' };
+/** Channel colours as RGB plus an alpha per element, so edge-fade gradients can be built from them. */
+type Tint = { rgb: string; line: number; fill: number; bar: number; cap: number };
+const LEFT_TINT: Tint = { rgb: '170,205,255', line: 0.26, fill: 0.035, bar: 0.1, cap: 0.4 };
+const RIGHT_TINT: Tint = { rgb: '255,190,215', line: 0.24, fill: 0.03, bar: 0.09, cap: 0.36 };
+
+/**
+ * Soft edges. Every view fades out over this many pixels at the top and bottom
+ * of the canvas, and toward both ends of the usable frequency range, so it
+ * dissolves where there is nothing to read rather than stopping on a line.
+ */
+const EDGE_FADE_PX = 40;
+/** Frequencies below the first and above the second fade in and out. */
+const FADE_LOW_HZ = [30, 60] as const;
+const FADE_HIGH_HZ = [12000, 16000] as const;
+/** Share of the width, at each end of the frequency axis, over which lines and bars fade. */
+const AXIS_FADE = 0.06;
+/** Whole-view fade with overall loudness: invisible at the first, full at the second. */
+const LOUDNESS_FADE = [0.03, 0.3] as const;
+/** The pitch-aligned views never read outside this range (≈25 Hz to 18 kHz). */
+const PITCH_MIN = 19;
+const PITCH_MAX = 134;
+/** Where the trail starts recording, it fades in over this many columns (0.5 s). */
+const TRAIL_RUN_FADE = 25;
+
+function smoothstep(edge0: number, edge1: number, x: number): number {
+  const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+  return t * t * (3 - 2 * t);
+}
+
+/** Fade for a row at canvas y whose centre frequency is `hz`. */
+function rowFade(y: number, canvasHeight: number, hz: number): number {
+  const edge = Math.min(1, y / EDGE_FADE_PX, (canvasHeight - y) / EDGE_FADE_PX);
+  if (edge <= 0) return 0;
+  const low = smoothstep(FADE_LOW_HZ[0], FADE_LOW_HZ[1], hz);
+  const high = 1 - smoothstep(FADE_HIGH_HZ[0], FADE_HIGH_HZ[1], hz);
+  return edge * low * high;
+}
+
+/**
+ * The roll's pitch axis, carried past the pitch rows. Row p spans axis values
+ * [p, p + 1) — its top edge is p + 1 — so a row's own pitch sits at p + 0.5.
+ */
+function pitchAtY(layout: SpectrumLayout, y: number): number {
+  return layout.pitchHigh + 1 - (y - layout.rollTop) / layout.rowHeight;
+}
+
+function yOfPitch(layout: SpectrumLayout, pitch: number): number {
+  return layout.rollTop + (layout.pitchHigh + 1 - pitch) * layout.rowHeight;
+}
 
 function normalise(db: number): number {
   const n = (db - FLOOR_DB) / (CEIL_DB - FLOOR_DB);
@@ -128,6 +181,10 @@ function pitchBands(centres: Float32Array, halfWidth: number, bins: number, samp
 }
 
 export class SpectrumPainter {
+  // shared: horizontal edge fades per tint element, keyed on width
+  private axisKey = '';
+  private readonly axisGradients = new Map<string, CanvasGradient>();
+
   // lines
   private lineKey = '';
   private lineBands: Bands = { from: new Int32Array(0), to: new Int32Array(0) };
@@ -146,8 +203,12 @@ export class SpectrumPainter {
   // pitch
   private pitchKey = '';
   private pitchBandsTable: Bands = { from: new Int32Array(0), to: new Int32Array(0) };
-  private readonly pitchLevelsLeft = new Float32Array(128);
-  private readonly pitchLevelsRight = new Float32Array(128);
+  /** Pitch rows across the whole canvas, bottom to top, and each one's fade. */
+  private pitchFirst = 0;
+  private pitchCount = 0;
+  private pitchFade = new Float32Array(0);
+  private readonly pitchLevelsLeft = new Float32Array(PITCH_MAX + 1);
+  private readonly pitchLevelsRight = new Float32Array(PITCH_MAX + 1);
   private readonly pitchLeft = new RectBuffer();
   private readonly pitchRight = new RectBuffer();
   private readonly pitchStrongLeft = new RectBuffer();
@@ -163,6 +224,12 @@ export class SpectrumPainter {
   private trailCtx: CanvasRenderingContext2D | null = null;
   private trailColumn: ImageData | null = null;
   private trailRows = 0;
+  /** Pitch at the trail canvas's top and bottom edges. */
+  private trailTopPitch = 0;
+  private trailBottomPitch = 0;
+  private trailRowFade = new Float32Array(0);
+  private trailAlpha = new Uint8Array(0);
+  private trailRunStart = 0;
   private trailBandKey = '';
   private trailBands: Bands = { from: new Int32Array(0), to: new Int32Array(0) };
   /** Absolute column held by each ring slot, or -1. */
@@ -190,6 +257,30 @@ export class SpectrumPainter {
     ctx.restore();
   }
 
+  /**
+   * A horizontal gradient in `tint` at `alpha`, transparent at both ends of the
+   * frequency axis: lines and bars fade into the keyboard edge and the far
+   * right rather than ending square.
+   */
+  private axisGradient(ctx: CanvasRenderingContext2D, layout: SpectrumLayout, tint: Tint, alpha: number): CanvasGradient {
+    const key = `${layout.width}|${layout.keyWidth}`;
+    if (key !== this.axisKey) {
+      this.axisKey = key;
+      this.axisGradients.clear();
+    }
+    const id = `${tint.rgb}|${alpha}`;
+    let gradient = this.axisGradients.get(id);
+    if (!gradient) {
+      gradient = ctx.createLinearGradient(layout.keyWidth, 0, layout.width, 0);
+      gradient.addColorStop(0, `rgba(${tint.rgb},0)`);
+      gradient.addColorStop(AXIS_FADE, `rgba(${tint.rgb},${alpha})`);
+      gradient.addColorStop(1 - AXIS_FADE * 1.5, `rgba(${tint.rgb},${alpha})`);
+      gradient.addColorStop(1, `rgba(${tint.rgb},0)`);
+      this.axisGradients.set(id, gradient);
+    }
+    return gradient;
+  }
+
   // ---- lines ---------------------------------------------------------------
 
   private drawLines(ctx: CanvasRenderingContext2D, spectrum: StereoSpectrum, layout: SpectrumLayout): void {
@@ -199,8 +290,10 @@ export class SpectrumPainter {
       this.lineKey = key;
       this.lineBands = logBands(columns, spectrum.left.length, spectrum.sampleRate);
     }
-    const drewLeft = this.drawLine(ctx, spectrum.left, columns, layout, layout.rollBottom, -1, LEFT_TINT);
-    const drewRight = this.drawLine(ctx, spectrum.right, columns, layout, layout.rollTop, 1, RIGHT_TINT);
+    // From the canvas edges, not the pitch rows: nothing cuts them off.
+    const drewLeft = this.drawLine(ctx, spectrum.left, columns, layout, layout.canvasHeight, -1, LEFT_TINT);
+    const drewRight = this.drawLine(ctx, spectrum.right, columns, layout, 0, 1, RIGHT_TINT);
+    ctx.globalAlpha = 1;
     this.drawChannelLabels(ctx, layout, drewLeft, drewRight);
   }
 
@@ -212,9 +305,9 @@ export class SpectrumPainter {
     layout: SpectrumLayout,
     baseline: number,
     direction: number,
-    tint: typeof LEFT_TINT,
+    tint: Tint,
   ): boolean {
-    const reach = (layout.rollBottom - layout.rollTop) * REACH * direction;
+    const reach = layout.canvasHeight * REACH * direction;
     let loudest = 0;
     ctx.beginPath();
     for (let c = 0; c < columns; c += 1) {
@@ -225,30 +318,34 @@ export class SpectrumPainter {
       if (c === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     }
-    // Silence is a flat line along the edge; drawing it adds nothing.
-    if (loudest <= 0.01) return false;
+    // Fades with loudness as a whole, so silence dissolves it rather than
+    // dropping it on a threshold.
+    const presence = smoothstep(LOUDNESS_FADE[0], LOUDNESS_FADE[1], loudest);
+    if (presence <= 0) return false;
+    ctx.globalAlpha = presence;
     ctx.lineWidth = 1;
-    ctx.strokeStyle = tint.line;
+    ctx.strokeStyle = this.axisGradient(ctx, layout, tint, tint.line);
     ctx.stroke();
     ctx.lineTo(layout.keyWidth + (columns - 1) * LINE_STEP, baseline);
     ctx.lineTo(layout.keyWidth, baseline);
     ctx.closePath();
-    ctx.fillStyle = tint.fill;
+    ctx.fillStyle = this.axisGradient(ctx, layout, tint, tint.fill);
     ctx.fill();
-    return true;
+    return presence > 0.3;
   }
 
   private drawChannelLabels(ctx: CanvasRenderingContext2D, layout: SpectrumLayout, left: boolean, right: boolean): void {
     ctx.font = '9px ui-monospace, SFMono-Regular, Menlo, monospace';
     ctx.textAlign = 'right';
+    // Just inside the soft edges, clear of the toolbar and the status bar.
     if (left) {
       ctx.textBaseline = 'bottom';
-      ctx.fillStyle = 'rgba(170,205,255,0.35)';
-      ctx.fillText('L', layout.width - 6, layout.rollBottom - 3);
+      ctx.fillStyle = `rgba(${LEFT_TINT.rgb},0.35)`;
+      ctx.fillText('L', layout.width - 6, layout.canvasHeight - EDGE_FADE_PX / 2);
     }
     if (right) {
       ctx.textBaseline = 'top';
-      ctx.fillStyle = 'rgba(255,190,215,0.35)';
+      ctx.fillStyle = `rgba(${RIGHT_TINT.rgb},0.35)`;
       ctx.fillText('R', layout.width - 6, layout.rollTop + 3);
     }
   }
@@ -268,9 +365,10 @@ export class SpectrumPainter {
 
     const slot = (layout.width - layout.keyWidth) / BAR_COUNT;
     const barWidth = Math.max(1, slot - BAR_GAP);
-    const reach = (layout.rollBottom - layout.rollTop) * REACH;
+    const reach = layout.canvasHeight * REACH;
+    const bottom = layout.canvasHeight;
     this.barsLeft.reset(); this.barsRight.reset(); this.capsLeft.reset(); this.capsRight.reset();
-    let anything = false;
+    let loudest = 0;
 
     for (let b = 0; b < BAR_COUNT; b += 1) {
       const x = layout.keyWidth + b * slot + BAR_GAP / 2;
@@ -285,36 +383,51 @@ export class SpectrumPainter {
       const hr = normalise(right) * reach;
       const cl = normalise(this.capLeft[b]!) * reach;
       const cr = normalise(this.capRight[b]!) * reach;
-      if (hl > 0.5) this.barsLeft.push(x, layout.rollBottom - hl, barWidth, hl);
-      if (hr > 0.5) this.barsRight.push(x, layout.rollTop, barWidth, hr);
-      if (cl > 1) this.capsLeft.push(x, layout.rollBottom - cl - 2, barWidth, 2);
-      if (cr > 1) this.capsRight.push(x, layout.rollTop + cr, barWidth, 2);
-      if (cl > 1 || cr > 1) anything = true;
+      if (hl > 0.5) this.barsLeft.push(x, bottom - hl, barWidth, hl);
+      if (hr > 0.5) this.barsRight.push(x, 0, barWidth, hr);
+      if (cl > 1) this.capsLeft.push(x, bottom - cl - 2, barWidth, 2);
+      if (cr > 1) this.capsRight.push(x, cr, barWidth, 2);
+      loudest = Math.max(loudest, cl / reach, cr / reach);
     }
-    if (!anything) return;
+    // Caps hold the recent peak, so the view fades out as they fall rather
+    // than vanishing the moment the music stops.
+    const presence = smoothstep(LOUDNESS_FADE[0], LOUDNESS_FADE[1], loudest);
+    if (presence <= 0) return;
 
+    ctx.globalAlpha = presence;
     ctx.globalCompositeOperation = 'lighter';
-    ctx.fillStyle = LEFT_TINT.bar;
+    ctx.fillStyle = this.axisGradient(ctx, layout, LEFT_TINT, LEFT_TINT.bar);
     this.barsLeft.fillInto(ctx);
-    ctx.fillStyle = RIGHT_TINT.bar;
+    ctx.fillStyle = this.axisGradient(ctx, layout, RIGHT_TINT, RIGHT_TINT.bar);
     this.barsRight.fillInto(ctx);
-    ctx.fillStyle = LEFT_TINT.cap;
+    ctx.fillStyle = this.axisGradient(ctx, layout, LEFT_TINT, LEFT_TINT.cap);
     this.capsLeft.fillInto(ctx);
-    ctx.fillStyle = RIGHT_TINT.cap;
+    ctx.fillStyle = this.axisGradient(ctx, layout, RIGHT_TINT, RIGHT_TINT.cap);
     this.capsRight.fillInto(ctx);
     ctx.globalCompositeOperation = 'source-over';
-    this.drawChannelLabels(ctx, layout, this.capsLeft.size > 0, this.capsRight.size > 0);
+    ctx.globalAlpha = 1;
+    this.drawChannelLabels(ctx, layout, presence > 0.3 && this.capsLeft.size > 0, presence > 0.3 && this.capsRight.size > 0);
   }
 
   // ---- pitch ---------------------------------------------------------------
 
   private drawPitch(ctx: CanvasRenderingContext2D, spectrum: StereoSpectrum, layout: SpectrumLayout): void {
-    const { pitchLow, pitchHigh } = layout;
-    const key = `${spectrum.left.length}|${spectrum.sampleRate}|${pitchLow}|${pitchHigh}`;
+    // Rows run the whole canvas: the roll's own pitch rows, plus the pitch axis
+    // carried up under the toolbar and down through the bounce band.
+    const top = Math.min(PITCH_MAX, Math.floor(pitchAtY(layout, 0)));
+    const bottom = Math.max(PITCH_MIN, Math.ceil(pitchAtY(layout, layout.canvasHeight)) - 1);
+    const key = `${spectrum.left.length}|${spectrum.sampleRate}|${bottom}|${top}|${layout.rollTop}|${layout.rowHeight}|${layout.canvasHeight}`;
     if (key !== this.pitchKey) {
       this.pitchKey = key;
-      const centres = new Float32Array(pitchHigh - pitchLow + 1);
-      for (let i = 0; i < centres.length; i += 1) centres[i] = pitchLow + i;
+      this.pitchFirst = bottom;
+      this.pitchCount = Math.max(0, top - bottom + 1);
+      const centres = new Float32Array(this.pitchCount);
+      this.pitchFade = new Float32Array(this.pitchCount);
+      for (let i = 0; i < this.pitchCount; i += 1) {
+        const pitch = bottom + i;
+        centres[i] = pitch;
+        this.pitchFade[i] = rowFade(yOfPitch(layout, pitch + 0.5), layout.canvasHeight, pitchToHz(pitch));
+      }
       this.pitchBandsTable = pitchBands(centres, 0.5, spectrum.left.length, spectrum.sampleRate);
     }
 
@@ -335,24 +448,27 @@ export class SpectrumPainter {
     }
 
     let loudest = 0;
-    for (let p = pitchLow; p <= pitchHigh; p += 1) {
-      const i = p - pitchLow;
+    for (let i = 0; i < this.pitchCount; i += 1) {
+      const pitch = this.pitchFirst + i;
       const from = this.pitchBandsTable.from[i]!;
       const to = this.pitchBandsTable.to[i]!;
-      const left = normalise(peakOf(spectrum.left, from, to));
-      const right = normalise(peakOf(spectrum.right, from, to));
-      this.pitchLevelsLeft[p] = left;
-      this.pitchLevelsRight[p] = right;
+      const fade = this.pitchFade[i]!;
+      const left = normalise(peakOf(spectrum.left, from, to)) * fade;
+      const right = normalise(peakOf(spectrum.right, from, to)) * fade;
+      this.pitchLevelsLeft[pitch] = left;
+      this.pitchLevelsRight[pitch] = right;
       loudest = Math.max(loudest, left, right);
     }
-    if (loudest <= 0.01) return;
+    const presence = smoothstep(LOUDNESS_FADE[0], LOUDNESS_FADE[1], loudest);
+    if (presence <= 0) return;
 
     this.pitchLeft.reset(); this.pitchRight.reset(); this.pitchStrongLeft.reset(); this.pitchStrongRight.reset();
     const height = Math.max(1, layout.rowHeight - (layout.rowHeight > 4 ? 1 : 0));
-    for (let p = pitchLow; p <= pitchHigh; p += 1) {
-      const y = layout.pitchY[p]!;
-      const left = this.pitchLevelsLeft[p]!;
-      const right = this.pitchLevelsRight[p]!;
+    for (let i = 0; i < this.pitchCount; i += 1) {
+      const pitch = this.pitchFirst + i;
+      const y = yOfPitch(layout, pitch + 1);
+      const left = this.pitchLevelsLeft[pitch]!;
+      const right = this.pitchLevelsRight[pitch]!;
       // Squared, so quiet pitches stay short and the loud ones stand out.
       const leftLength = left * left * maxLength;
       const rightLength = right * right * maxLength;
@@ -367,8 +483,9 @@ export class SpectrumPainter {
     }
 
     ctx.beginPath();
-    ctx.rect(layout.keyWidth, layout.rollTop, layout.width - layout.keyWidth, layout.rollBottom - layout.rollTop);
+    ctx.rect(layout.keyWidth, 0, layout.width - layout.keyWidth, layout.canvasHeight);
     ctx.clip();
+    ctx.globalAlpha = presence;
     ctx.globalCompositeOperation = 'lighter';
     ctx.fillStyle = this.pitchGradientLeft!;
     this.pitchLeft.fillInto(ctx);
@@ -381,12 +498,26 @@ export class SpectrumPainter {
   // ---- trail ---------------------------------------------------------------
 
   /** Allocates or clears the ring when the scene or pitch range changes. */
+  private trailLayoutKey(layout: SpectrumLayout): string {
+    return `${layout.pitchLow}|${layout.pitchHigh}|${layout.rollTop}|${layout.rowHeight}|${layout.canvasHeight}`;
+  }
+
   private ensureTrail(layout: SpectrumLayout): boolean {
-    const key = `${layout.pitchLow}|${layout.pitchHigh}`;
+    // Keyed on the whole vertical layout: the trail spans the canvas along the
+    // roll's pitch axis, so a new height or row size re-maps every row.
+    const key = this.trailLayoutKey(layout);
     if (this.trailCanvas && key === this.trailKey && this.trailScene === layout.scene) return true;
     this.trailKey = key;
     this.trailScene = layout.scene;
-    this.trailRows = (layout.pitchHigh - layout.pitchLow + 1) * TRAIL_ROWS_PER_SEMITONE;
+    this.trailTopPitch = Math.min(PITCH_MAX, pitchAtY(layout, 0));
+    this.trailBottomPitch = Math.max(PITCH_MIN, pitchAtY(layout, layout.canvasHeight));
+    this.trailRows = Math.max(1, Math.ceil((this.trailTopPitch - this.trailBottomPitch) * TRAIL_ROWS_PER_SEMITONE));
+    this.trailRowFade = new Float32Array(this.trailRows);
+    this.trailAlpha = new Uint8Array(this.trailRows);
+    for (let r = 0; r < this.trailRows; r += 1) {
+      const axis = this.trailTopPitch - (r + 0.5) / TRAIL_ROWS_PER_SEMITONE;
+      this.trailRowFade[r] = rowFade(yOfPitch(layout, axis), layout.canvasHeight, pitchToHz(axis - 0.5));
+    }
     const canvas = this.trailCanvas ?? document.createElement('canvas');
     canvas.width = TRAIL_COLUMNS;
     canvas.height = this.trailRows; // also clears it
@@ -410,7 +541,8 @@ export class SpectrumPainter {
       // Row 0 is the top: the highest pitch, as in the roll.
       const centres = new Float32Array(this.trailRows);
       for (let r = 0; r < this.trailRows; r += 1) {
-        centres[r] = layout.pitchHigh + 0.5 - (r + 0.5) / TRAIL_ROWS_PER_SEMITONE;
+        // Axis value to pitch: a row's pitch sits half a semitone below its top.
+        centres[r] = this.trailTopPitch - (r + 0.5) / TRAIL_ROWS_PER_SEMITONE - 0.5;
       }
       this.trailBands = pitchBands(centres, 0.5 / TRAIL_ROWS_PER_SEMITONE, spectrum.left.length, spectrum.sampleRate);
     }
@@ -429,13 +561,20 @@ export class SpectrumPainter {
       pixels[o] = 90 + 165 * lit * lit;
       pixels[o + 1] = 150 + 105 * lit;
       pixels[o + 2] = 255;
-      pixels[o + 3] = Math.sqrt(lit) * 255;
+      // Soft at the canvas edges and the ends of the frequency range.
+      this.trailAlpha[r] = Math.sqrt(lit) * 255 * this.trailRowFade[r]!;
     }
 
     // Fill every column since the last one written, so a slow frame leaves no
     // gap; a seek or a long stall starts a new run instead.
-    const first = column > this.trailLast && column - this.trailLast <= TRAIL_MAX_FILL ? this.trailLast + 1 : column;
+    const continues = column > this.trailLast && column - this.trailLast <= TRAIL_MAX_FILL;
+    const first = continues ? this.trailLast + 1 : column;
+    if (!continues) this.trailRunStart = column;
     for (let c = first; c <= column; c += 1) {
+      // A run fades in from where recording started instead of beginning on a
+      // hard vertical edge.
+      const ramp = Math.min(1, (c - this.trailRunStart + 1) / TRAIL_RUN_FADE);
+      for (let r = 0; r < this.trailRows; r += 1) pixels[r * 4 + 3] = this.trailAlpha[r]! * ramp;
       const slot = c % TRAIL_COLUMNS;
       this.trailCtx!.putImageData(image, slot, 0);
       this.trailStamp[slot] = c;
@@ -445,7 +584,7 @@ export class SpectrumPainter {
 
   private drawTrail(ctx: CanvasRenderingContext2D, layout: SpectrumLayout): void {
     if (!this.trailCanvas || this.trailScene !== layout.scene
-      || this.trailKey !== `${layout.pitchLow}|${layout.pitchHigh}`) return;
+      || this.trailKey !== this.trailLayoutKey(layout)) return;
     const pps = layout.pixelsPerSecond;
     const playColumn = Math.floor(layout.playheadSeconds * TRAIL_RATE);
     const leftSeconds = layout.playheadSeconds - (layout.centreX - layout.keyWidth) / pps;
@@ -453,12 +592,13 @@ export class SpectrumPainter {
     if (playColumn < start) return;
 
     ctx.beginPath();
-    ctx.rect(layout.keyWidth, layout.rollTop, layout.centreX - layout.keyWidth, layout.rollBottom - layout.rollTop);
+    ctx.rect(layout.keyWidth, 0, layout.centreX - layout.keyWidth, layout.canvasHeight);
     ctx.clip();
     ctx.globalCompositeOperation = 'lighter';
     ctx.globalAlpha = 0.8;
     ctx.imageSmoothingEnabled = true;
-    const height = layout.rollBottom - layout.rollTop;
+    const top = yOfPitch(layout, this.trailTopPitch);
+    const height = yOfPitch(layout, this.trailBottomPitch) - top;
     const toX = (column: number) => layout.centreX + (column / TRAIL_RATE - layout.playheadSeconds) * pps;
 
     // One drawImage per run of valid, contiguous columns (two where it wraps).
@@ -467,7 +607,7 @@ export class SpectrumPainter {
       const valid = c <= playColumn && this.trailStamp[c % TRAIL_COLUMNS] === c;
       if (valid && runStart < 0) runStart = c;
       if (!valid && runStart >= 0) {
-        this.blitRun(ctx, runStart, c - 1, toX, layout.rollTop, height);
+        this.blitRun(ctx, runStart, c - 1, toX, top, height);
         runStart = -1;
       }
     }

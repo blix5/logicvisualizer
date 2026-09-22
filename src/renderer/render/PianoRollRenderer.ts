@@ -358,6 +358,7 @@ export class PianoRollRenderer {
         pitchHigh: scene.pitchHigh,
         pitchY: this.pitchY,
         rowHeight: this.rowHeight,
+        canvasHeight: height,
         pixelsPerSecond: view.pixelsPerSecond,
         playheadSeconds: view.playheadSeconds,
         live: view.spectrumLive ?? false,

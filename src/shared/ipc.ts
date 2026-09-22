@@ -20,10 +20,22 @@ export type AudioFileBytes = {
   bytes: ArrayBuffer;
 };
 
+/**
+ * A recent project's thumbnail, read from the WindowImage.jpg inside the bundle.
+ * `exists` is whether the project can still be opened at all (bundle + ProjectData
+ * present); `dataUrl` is a downscaled JPEG, or null when there is no window image.
+ */
+export type RecentPreview = {
+  exists: boolean;
+  dataUrl: string | null;
+};
+
 export type LvApi = {
   project: {
     pick(): Promise<string | null>;
     load(selectionPath: string): Promise<Result<ProjectModel>>;
+    /** A downscaled preview + availability for a recent project path. */
+    preview(projectPath: string): Promise<Result<RecentPreview>>;
   };
   bounce: {
     pick(): Promise<string | null>;
@@ -38,6 +50,7 @@ export type LvApi = {
 export const CHANNELS = {
   projectPick: 'project:pick',
   projectLoad: 'project:load',
+  projectPreview: 'project:preview',
   bouncePick: 'bounce:pick',
   bounceRead: 'bounce:read',
   audioRead: 'audio:read',

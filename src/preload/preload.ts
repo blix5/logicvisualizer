@@ -5,6 +5,7 @@ const api: LvApi = {
   project: {
     pick: () => ipcRenderer.invoke(CHANNELS.projectPick),
     load: (selectionPath) => ipcRenderer.invoke(CHANNELS.projectLoad, selectionPath),
+    preview: (projectPath) => ipcRenderer.invoke(CHANNELS.projectPreview, projectPath),
   },
   bounce: {
     pick: () => ipcRenderer.invoke(CHANNELS.bouncePick),

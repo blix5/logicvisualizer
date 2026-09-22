@@ -89,6 +89,61 @@ body {
   -webkit-app-region: drag;
 }
 
+/*
+ * Title and tempo, centred over the canvas regardless of the controls either
+ * side. They sit outside the toolbar so they stay when it is hidden, and let
+ * clicks and window drags fall through to whatever is underneath.
+ */
+.header-title {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 3;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  pointer-events: none;
+  white-space: nowrap;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+}
+.header-title .title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  /*
+   * Whatever the controls either side leave free, worked out per breakpoint
+   * below: the window width less twice the wider side, less the tempo and a
+   * margin. Long names ellipsize rather than slide under a control.
+   */
+  max-width: max(60px, calc(100vw - 1220px));
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/*
+ * Chrome is not content: nothing in the toolbar, title or status bar selects
+ * on a drag or double-click. Error and warning text stays selectable, since
+ * it is the one thing worth copying out.
+ */
+.toolbar,
+.dragstrip,
+.header-title,
+.statusbar,
+.empty h1,
+button,
+label,
+canvas {
+  -webkit-user-select: none;
+  user-select: none;
+}
+.statusbar .error,
+.statusbar .warn {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
 button {
   appearance: none;
   background: rgba(255, 255, 255, 0.07);
@@ -191,15 +246,21 @@ select.spectrum {
 select.spectrum:hover { background-color: rgba(255, 255, 255, 0.12); }
 select.spectrum option { background: #1a1d24; color: var(--text); }
 
-/* One line at any width: the least essential readouts give way first. */
-@media (max-width: 1180px) {
-  .toolbar .readout.key { display: none; }
-}
-@media (max-width: 1060px) {
+/*
+ * One line at any width, with the centred title clear of the controls either
+ * side: the least essential pieces give way first.
+ */
+@media (max-width: 1500px) {
   .toolbar label.field.speed { display: none; }
+  .header-title .title { max-width: max(60px, calc(100vw - 1040px)); }
 }
-@media (max-width: 960px) {
-  .toolbar label.field { font-size: 0; gap: 0; }
+@media (max-width: 1300px) {
+  .toolbar .readout.key { display: none; }
+  .header-title .title { max-width: max(60px, calc(100vw - 1020px)); }
+}
+@media (max-width: 1150px) {
+  .toolbar label.field { display: none; }
+  .header-title .title { max-width: max(60px, calc(100vw - 800px)); }
 }
 
 .stage {
@@ -230,8 +291,6 @@ select.spectrum option { background: #1a1d24; color: var(--text); }
   border-radius: 8px;
 }
 
-.project-name { color: var(--text); }
-
 .statusbar {
   flex: none;
   display: flex;
@@ -244,6 +303,9 @@ select.spectrum option { background: #1a1d24; color: var(--text); }
   font-size: 11.5px;
   overflow-x: auto;
   white-space: nowrap;
+  /* Still scrolls sideways when the stats run long, without a bar across it. */
+  scrollbar-width: none;
 }
+.statusbar::-webkit-scrollbar { display: none; }
 .warn { color: #ffb86b; }
 .error { color: var(--accent); }

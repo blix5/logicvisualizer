@@ -111,7 +111,9 @@ export function App(): JSX.Element {
   const dirtyRef = useRef(0);
   // The render loop reads these refs directly so it never depends on React
   // re-rendering at frame rate.
-  const topInset = headerHidden ? 0 : HEADER_HEIGHT;
+  // Room is kept for the header whether or not it is showing: the title stays
+  // up either way, and hiding the toolbar should not reflow the canvas.
+  const topInset = HEADER_HEIGHT;
   const viewRef = useRef({ pixelsPerSecond, mode, bounceOffset, spectrumMode, topInset, particles });
   viewRef.current = { pixelsPerSecond, mode, bounceOffset, spectrumMode, topInset, particles };
 
@@ -284,8 +286,6 @@ export function App(): JSX.Element {
   useEffect(() => {
     let frame = 0;
     let lastKey = '';
-    let lastLabel = '';
-    let lastTempo = '';
     let lastSounding = 0;
     let spectrumFrame = 0;
     let particleFrame = 0;
@@ -352,18 +352,16 @@ export function App(): JSX.Element {
         else renderer.draw(scene, state);
       }
 
+      // Compared against the element's own text, not a cached last value: the
+      // position readout is recreated each time the toolbar is shown again.
       const label = formatTime(projectSeconds);
-      if (label !== lastLabel) {
-        lastLabel = label;
-        if (positionRef.current) positionRef.current.textContent = label;
-      }
+      const position = positionRef.current;
+      if (position && position.textContent !== label) position.textContent = label;
       if (tempoMap) {
         const bpm = bpmAtBeat(tempoMap, secondsToBeats(tempoMap, Math.max(0, projectSeconds)));
         const tempo = `${Math.round(bpm * 10) / 10} BPM`;
-        if (tempo !== lastTempo) {
-          lastTempo = tempo;
-          if (tempoRef.current) tempoRef.current.textContent = tempo;
-        }
+        const readout = tempoRef.current;
+        if (readout && readout.textContent !== tempo) readout.textContent = tempo;
       }
     };
     frame = requestAnimationFrame(tick);
@@ -489,8 +487,6 @@ export function App(): JSX.Element {
               <MusicUploadIcon />
             </button>
 
-            <span className="spacer" />
-
             <button className="icon" onClick={togglePlay} disabled={!project} title={playing ? 'Pause (Space)' : 'Play (Space)'} aria-label={playing ? 'Pause' : 'Play'}>
               {playing ? <PauseIcon /> : <PlayIcon />}
             </button>
@@ -498,9 +494,6 @@ export function App(): JSX.Element {
               <ToStartIcon />
             </button>
             <span className="readout" ref={positionRef}>0:00.00</span>
-            <span className="readout tempo" ref={tempoRef}>
-              {project ? `${project.baseBpm} BPM` : '— BPM'}
-            </span>
             {project && (
               <span className="readout key" title="Key and time signature">
                 {formatKey(project.songKey, project.songScale)}
@@ -508,6 +501,9 @@ export function App(): JSX.Element {
                 {formatMeter(project)}
               </span>
             )}
+
+            {/* The centre is taken by the title, which lives outside the toolbar. */}
+            <span className="spacer" />
 
             <label className="field" title="Bounce offset, in seconds">
               offset
@@ -595,10 +591,20 @@ export function App(): JSX.Element {
             </button>
           </header>
         )}
+
+        {/*
+          Title and tempo, centred over the canvas. Outside the toolbar so they
+          stay put, and stay visible, when it is hidden.
+        */}
+        <div className="header-title">
+          <span className="title">{project ? project.projectName : 'Logic Visualizer'}</span>
+          <span className="readout tempo" ref={tempoRef}>
+            {project ? `${project.baseBpm} BPM` : '— BPM'}
+          </span>
+        </div>
       </div>
 
       <div className="statusbar">
-        {project && <span className="project-name">{project.projectName}</span>}
         {error && <span className="error">{error}</span>}
         {!error && status && <span>{status}</span>}
         {project && stats && (
