@@ -268,6 +268,50 @@ corpus, re_probe14's included). A per-track record at bar 1 has the same shape
 drops it; the four that did land on a cell were nameless, noteless and
 near-zero length, and a one-sixteenth minimum length rejects them.
 
+**But Logic Pro 11 moved MIDI mute onto the definition too** — the region cell's
+padded-name-end `+0x4e` bit 0. djpubichair's three "Gentle Sine Bells" copies
+muted at bar 65 (tracks 27/28/30) keep `+8` = `+32` on the placement (so the
+old test sees them unmuted) and instead set `+0x4e` bit 0 on their cells; only 5
+of the project's 301 cells carry it. The parser marks a MIDI region muted if
+**either** the placement (`+8` = 0) or the cell (`+0x4e` bit 0) says so — the
+exact mirror of the audio mute's two locations.
+
+### Region reverse — solved
+
+**Audio reverse is `+48` bit 5 (`0x20`)** — the same flags byte that carries Flex
+at bit 7. Established from `djpubichair.logicx`'s "crash" track: fifteen
+placements are cut from one file (`AuRg` ref 184), and the owner reversed exactly
+the copies at bars 8, 24, 32, 48, 64, 72, 104. Those seven read `0x3c` at `+48`
+against the forward copies' `0x1c` — a clean single-bit difference with the file,
+trim-in and length all identical, so it is the reverse toggle and nothing else.
+Across the project the bit is set on 245 of 1,871 placements (~13%; this is a
+heavily reversed glitch project). The bit is independent of Flex (bit 7).
+
+The reversed copies also carried a clip gain and a fade the forward ones lacked,
+but those co-vary only because the owner mixed the reverse-swells that way; they
+are not part of the reverse encoding. Reverse is decoded but has no bearing on a
+region's position or length — only the renderer mirrors the waveform.
+
+### Region mute, take two — the definition carries it in Logic Pro 11
+
+`+15` bit 0 (above) is a genuine audio-mute flag in re_probe12, but it is set on
+**none** of djpubichair's muted regions: its `kick 2` copies muted at bars 67–72
+are byte-identical to the unmuted ones across the whole 80-byte placement unit.
+Real projects keep region mute on the **definition**, not the placement:
+
+**Audio mute is also `AuRg` (`gRuA`) `+41` bit 1 (`0x02`).** Established by
+un-muting eight `kick 2` copies (bars 65–72) in djpubichair and diffing the save:
+exactly those eight AuRg records cleared `+41` bit 1 and nothing else in the file
+did, taking the project's muted count from 262 to 254. The placement bytes only
+changed in their *selection* flag (`+15` bit 7), which is why the muted and
+unmuted placements looked identical — the mute was never there. `+41` also holds
+unrelated bits (`0x01`, `0x40`, `0x80`) that vary independently.
+
+Because each placement joins to its own AuRg (via `regionRef` + ordinal), a
+per-definition flag is still effectively per-placement. The parser marks a region
+muted if **either** location is set — `+15` bit 0 for re_probe12 and older
+projects, `+41` bit 1 for Logic Pro 11.
+
 ### Automation — solved
 
 Automation lives in its own `qSvE` whose payload is a whole number of 16-byte

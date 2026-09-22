@@ -48,6 +48,12 @@ export type LvApi = {
     saved(projectPath: string): Promise<Result<BounceFile | null>>;
     /** Forgets and deletes a project's saved bounce. */
     clear(projectPath: string): Promise<Result<{ cleared: boolean }>>;
+    /**
+     * Opens the project in Logic Pro and drives a full bounce via AppleScript,
+     * then stores and returns the rendered mixdown. macOS only; needs
+     * Accessibility + Automation permission.
+     */
+    auto(projectPath: string): Promise<Result<BounceFile>>;
   };
   audio: {
     /** Reads a media file from the open project. Path must be inside the bundle. */
@@ -64,5 +70,6 @@ export const CHANNELS = {
   bounceSave: 'bounce:save',
   bounceSaved: 'bounce:saved',
   bounceClear: 'bounce:clear',
+  bounceAuto: 'bounce:auto',
   audioRead: 'audio:read',
 } as const;

@@ -95,6 +95,53 @@ test('flex-on regions are stretched to their musical length', { skip: (() => {
   assert.ok(flexOn > 0, 'at least one flex-on region to check');
 });
 
+test('reversed audio regions decode from the +48 flag', { skip: (() => {
+  const r = process.env.LV_PROJECTS_DIR ?? path.join(os.homedir(), 'Music', 'Logic');
+  return !fs.existsSync(path.join(r, 'djpubichair.logicx')) && 'djpubichair.logicx not found';
+})() }, () => {
+  // djpubichair's "crash" track holds one cymbal cut placed many times; the
+  // owner reversed exactly the copies at bars 8, 24, 32, 48, 64, 72, 104. Those
+  // seven set +48 bit 5 while the forward copies do not, with the source file
+  // and trim identical -- the clean split that established the reverse flag.
+  const model = buildProjectModel(path.join(root, 'djpubichair.logicx'));
+  const crash = model.tracks.find((t) => t.name === 'crash');
+  assert.ok(crash, 'found the crash track');
+  const bar = (r) => Math.round(r.startBeat / 4) + 1;
+  const reversedBars = model.regions
+    .filter((r) => r.trackId === crash.id && r.kind === 'audio' && r.reversed)
+    .map(bar)
+    .sort((a, b) => a - b);
+  assert.deepEqual(reversedBars, [8, 24, 32, 48, 64, 72, 104]);
+});
+
+test('muted audio regions decode from the AuRg definition', { skip: (() => {
+  const r = process.env.LV_PROJECTS_DIR ?? path.join(os.homedir(), 'Music', 'Logic');
+  return !fs.existsSync(path.join(r, 'djpubichair.logicx')) && 'djpubichair.logicx not found';
+})() }, () => {
+  // Real projects (Logic Pro 11) store region mute on the definition (AuRg +41
+  // bit 1), not the placement's +15, so the placement-only check saw none of
+  // djpubichair's ~260 muted regions. The exact count shifts as the owner edits,
+  // so this asserts the detection works at all rather than a brittle total.
+  const model = buildProjectModel(path.join(root, 'djpubichair.logicx'));
+  const mutedAudio = model.regions.filter((r) => r.kind === 'audio' && r.muted);
+  assert.ok(mutedAudio.length >= 100, `many muted audio regions are detected (${mutedAudio.length})`);
+});
+
+test('muted MIDI regions decode from the region cell', { skip: (() => {
+  const r = process.env.LV_PROJECTS_DIR ?? path.join(os.homedir(), 'Music', 'Logic');
+  return !fs.existsSync(path.join(r, 'djpubichair.logicx')) && 'djpubichair.logicx not found';
+})() }, () => {
+  // MIDI mute also moved to the definition (region cell +0x4e bit 0) in Logic
+  // Pro 11: three "Gentle Sine Bells" copies muted at bar 65 (on the bass synth
+  // hit / bass / bass high accent tracks) keep +8 = +32 on the placement, so the
+  // old placement-only check saw them unmuted. bar N starts at beat (N-1)*4.
+  const model = buildProjectModel(path.join(root, 'djpubichair.logicx'));
+  const bar = (r) => Math.round(r.startBeat / 4) + 1;
+  const mutedAtBar65 = model.regions.filter((r) => r.kind === 'midi' && r.muted && bar(r) === 65);
+  assert.equal(mutedAtBar65.length, 3, 'the three bar-65 bass MIDI regions are muted');
+  assert.ok(mutedAtBar65.every((r) => r.name === 'Gentle Sine Bells'));
+});
+
 test('tempo changes and curves are decoded', { skip: (() => {
   const r = process.env.LV_PROJECTS_DIR ?? path.join(os.homedir(), 'Music', 'Logic');
   return !fs.existsSync(path.join(r, 'djpubichair.logicx')) && 'djpubichair.logicx not found';

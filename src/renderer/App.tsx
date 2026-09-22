@@ -6,6 +6,7 @@ import { PeakStore } from './audio/PeakStore';
 import {
   ArrangeIcon,
   AudioToMidiIcon,
+  AutoBounceIcon,
   ChevronDownIcon,
   ChevronUpIcon,
   MusicUploadIcon,
@@ -293,6 +294,27 @@ export function App(): JSX.Element {
     if (ok && project) void window.lv.bounce.save(project.projectPath, result.path);
   }, [applyBounce, project]);
 
+  // Opens the project in Logic and drives a full bounce there, then loads the
+  // rendered mixdown. The main process has already persisted it, so unlike
+  // openBounce there's no separate save. Logic must be installed, and macOS
+  // Accessibility + Automation permission granted — failures say which.
+  const autoBounce = useCallback(async () => {
+    if (!project) return;
+    setBusy(true);
+    setError(null);
+    setStatus('Bouncing in Logic Pro… (Logic will come to the front)');
+    const result = await window.lv.bounce.auto(project.projectPath);
+    if (isFailure(result)) {
+      setBusy(false);
+      // A user cancel is expected, not an error worth flagging in red.
+      if (result.error === 'Bounce cancelled.') setStatus('Bounce cancelled.');
+      else setError(result.error);
+      return;
+    }
+    await applyBounce(result);
+    setBusy(false);
+  }, [applyBounce, project]);
+
   // Renderer setup + resize.
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -490,7 +512,8 @@ export function App(): JSX.Element {
             {/* No project is open here, so a cleared bounce cannot be the live one. */}
             <RecentGrid recents={recents} onOpen={openRecent} onRemove={removeRecent} />
             <p>
-              Open a <code>.logicx</code> project, then import a bounced mixdown of it.
+              Open a <code>.logicx</code> project, then import a bounced mixdown of it —
+              or auto-bounce it in Logic Pro from the toolbar.
               The arrangement scrolls past a fixed centre playhead in time with the bounce.
             </p>
             <p>Space plays · ⌘-scroll zooms · scroll moves vertically · shift-scroll scrubs · H hides the toolbar</p>
@@ -525,6 +548,15 @@ export function App(): JSX.Element {
               aria-label={bounceName ? 'Change bounce' : 'Import bounce'}
             >
               <MusicUploadIcon />
+            </button>
+            <button
+              className="icon"
+              onClick={() => void autoBounce()}
+              disabled={!project || busy}
+              title="Auto-bounce in Logic Pro"
+              aria-label="Auto-bounce in Logic Pro"
+            >
+              <AutoBounceIcon />
             </button>
 
             {/* Separates the file controls from the transport controls. */}

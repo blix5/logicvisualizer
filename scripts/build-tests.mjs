@@ -13,6 +13,8 @@ await build({
     peaks: 'src/renderer/render/peaks.ts',
     rollScene: 'src/renderer/render/rollScene.ts',
     transcribe: 'src/renderer/audio/transcribe.ts',
+    logicControl: 'src/main/bounce/logicControl.ts',
+    autoBounce: 'src/main/bounce/autoBounce.ts',
   },
   bundle: true,
   platform: 'node',

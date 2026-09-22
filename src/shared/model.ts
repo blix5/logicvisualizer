@@ -54,6 +54,8 @@ export type AudioRegionModel = RegionBase & {
   gainDb: number;
   /** Flex on in Logic. */
   flex: boolean;
+  /** Reverse on in Logic: the region plays back-to-front, so its waveform is mirrored. */
+  reversed: boolean;
   /** Fade lengths, from the region's start and to its end. 0 when there is none. */
   fadeInSeconds: number;
   fadeOutSeconds: number;

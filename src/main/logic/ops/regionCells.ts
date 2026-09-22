@@ -45,6 +45,12 @@ const LEN_FIELD_OFF = 0x3c; // padded name end + 0x3c: u32 region length (ticks)
 const POS_FIELD_OFF = 0xe0; // padded name end + 0xe0: u32 position (ticks from bar 1, NO +38400)
 const CID_PRE_OFF = 0x2c; // qeSM + 0x2c: content id of the FOLLOWING qSvE
 const CACHE_MARKER_OFF = 0x4b; // padded name end + 0x4b: 0x54 marker; +1 = length-remainder cache
+// padded name end + 0x4e: bit 0 set when the region is muted. Established from
+// djpubichair.logicx's three "Gentle Sine Bells" copies muted at bar 65 (tracks
+// 27/28/30): their cells read 0x01 here where every unmuted copy reads 0x00, and
+// only 5 of the project's 301 cells carry it. This is where Logic Pro 11 keeps
+// MIDI region mute; the placement's +8 = 0 (re_probe14) is a second, older form.
+const MUTE_FLAG_OFF = 0x4e;
 const QESM_PAYLOAD_OFF = 0x1c; // standard chunk-header length slot (bytes from header end to karT)
 const CHUNK_ID_OFF = 10; // every 36-byte chunk header: [4cc][u16][u32 type][u32 id]
 const CHUNK_HEADER_SIZE = 36;
@@ -85,6 +91,8 @@ export type RegionCell = {
   qsve: number;
   lengthTicks: number;
   positionTicks: number;
+  /** Region mute, stored on the definition (padded name end +0x4e bit 0) as of Logic Pro 11. */
+  muted: boolean;
   preCid: number;
   qesmId: number;
   kartId: number;
@@ -142,6 +150,7 @@ export function scanRegionCells(buffer: Buffer): RegionCell[] {
       qsve,
       lengthTicks: buffer.readUInt32LE(nameEnd + LEN_FIELD_OFF),
       positionTicks: buffer.readUInt32LE(nameEnd + POS_FIELD_OFF),
+      muted: (buffer.readUInt8(nameEnd + MUTE_FLAG_OFF) & 0x01) !== 0,
       preCid,
       qesmId: buffer.readUInt32LE(start + CHUNK_ID_OFF),
       kartId: buffer.readUInt32LE(kart + CHUNK_ID_OFF),

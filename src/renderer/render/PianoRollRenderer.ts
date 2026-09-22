@@ -415,6 +415,8 @@ export class PianoRollRenderer {
     spp: number,
     rate: number,
     originSource: number,
+    reversed = false,
+    sourceSpan = 0,
   ): number {
     const count = Math.max(0, Math.ceil((right - left) / step) + 1);
     if (count > this.envHigh.length) {
@@ -430,7 +432,12 @@ export class PianoRollRenderer {
     const perColumn = step * spp * rate;
     for (let n = 0; n < count; n += 1) {
       const x = left + n * step;
-      const from = (x - originX) * spp * rate + originSource;
+      // A reversed region maps back-to-front: the source runs from the trimmed
+      // span's end toward its start as x increases, mirroring the waveform.
+      const offset = (x - originX) * spp * rate;
+      const from = reversed
+        ? originSource + sourceSpan - offset - perColumn
+        : originSource + offset;
       let first = Math.floor(from * bucketRate);
       let last = Math.ceil((from + perColumn) * bucketRate);
       if (last <= first) last = first + 1;
@@ -524,9 +531,11 @@ export class PianoRollRenderer {
       const left = Math.floor(Math.max(KEY_WIDTH, startX));
       const right = Math.min(width, endX);
       if (right <= left) continue;
+      const bgRate = region.sourceRate > 0 ? region.sourceRate : 1;
       const count = this.envelope(
         pyramid, left, right, BACKGROUND_STEP, startX, spp,
-        region.sourceRate > 0 ? region.sourceRate : 1, region.fileStartSeconds,
+        bgRate, region.fileStartSeconds,
+        region.reversed, (region.endSeconds - region.startSeconds) * bgRate,
       );
       this.applyFades(region, count, left, BACKGROUND_STEP, startX, spp);
       const active = view.playheadSeconds >= region.startSeconds && view.playheadSeconds <= region.endSeconds;
@@ -669,10 +678,12 @@ export class PianoRollRenderer {
       const region = sources[source[i]!]!;
       const pyramid = region.audioFileId ? view.peaks(region.audioFileId) : null;
       const regionX = toX(region.startSeconds);
+      const noteRate = region.sourceRate > 0 ? region.sourceRate : 1;
       const count = pyramid
         ? this.envelope(
           pyramid, left, right, 1, regionX, spp,
-          region.sourceRate > 0 ? region.sourceRate : 1, region.fileStartSeconds,
+          noteRate, region.fileStartSeconds,
+          region.reversed, (region.endSeconds - region.startSeconds) * noteRate,
         )
         : 0;
       this.applyFades(region, count, left, 1, regionX, spp);

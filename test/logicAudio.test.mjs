@@ -18,11 +18,13 @@ function auFl(fileName) {
   return record;
 }
 
-function auRg({ name, oid, ordinal = 0, lengthSamples = 88_200, fileStartSamples = 0 }) {
+function auRg({ name, oid, ordinal = 0, lengthSamples = 88_200, fileStartSamples = 0, muted = false }) {
   const record = Buffer.alloc(300);
   record.write('gRuA', 0, 'ascii');
   record.writeUInt32LE(oid, 10);
   record.writeUInt16LE(ordinal, 14);
+  // +41 flags byte: mute is bit 1 (0x02).
+  record.writeUInt8(muted ? 0x02 : 0x00, 41);
   record.writeUInt32LE(fileStartSamples, 42);
   record.writeUInt32LE(lengthSamples, 58);
   record.writeUInt16LE(name.length, 110);
@@ -45,7 +47,8 @@ function arrangeList(units, { markerFor = () => 0x24 } = {}) {
     chunk.writeUInt8(unit.trackNumber ?? 1, at + 20);
     chunk.writeUInt32LE(unit.ordinal ?? 0, at + 40);
     chunk.writeUInt32LE(unit.regionRef, at + 44);
-    chunk.writeUInt8(unit.flex ? 0x97 : 0x17, at + 48);
+    // +48 flags byte: baseline 0x17, flex is bit 7 (0x80), reverse is bit 5 (0x20).
+    chunk.writeUInt8(0x17 | (unit.flex ? 0x80 : 0) | (unit.reversed ? 0x20 : 0), at + 48);
     chunk.writeInt8(unit.gainDb ?? 0, at + 52);
     // A selected region reads 0x80 here; mute is bit 0 on top of it.
     chunk.writeUInt8((unit.selected ? 0x80 : 0) | (unit.muted ? 0x01 : 0), at + 15);
@@ -175,6 +178,38 @@ test('region mute is bit 0 of +15, independent of the selection bit', () => {
   assert.deepEqual(parseArrangeUnits(buffer).map((u) => u.muted), [false, true, false]);
 });
 
+test('region mute also decodes from the AuRg definition (+41 bit 1) as Logic Pro 11 stores it', () => {
+  // djpubichair keeps region mute on the definition, not the placement: its
+  // "kick 2" copies muted at bars 65-72 are byte-identical placements whose AuRg
+  // records carry +41 bit 1. Two placements of two definitions, one muted there.
+  const buffer = Buffer.concat([
+    auRg({ name: 'plain', oid: 8, ordinal: 0 }),
+    auRg({ name: 'muted-def', oid: 8, ordinal: 1, muted: true }),
+    arrangeList([
+      { bar: 0, trackNumber: 1, regionRef: 8, ordinal: 0 },
+      { bar: 4, trackNumber: 1, regionRef: 8, ordinal: 1 },
+    ]),
+  ]);
+  assert.deepEqual(placedAudioRegions(buffer).map((r) => [r.name, r.muted]), [
+    ['plain', false],
+    ['muted-def', true],
+  ]);
+});
+
+test('region reverse is bit 5 of the +48 flags byte, independent of flex', () => {
+  // djpubichair "crash": forward regions read 0x1c at +48, reversed ones 0x3c.
+  const buffer = arrangeList([
+    { bar: 0, regionRef: 8 },
+    { bar: 4, regionRef: 8, reversed: true },
+    { bar: 8, regionRef: 8, flex: true },
+    { bar: 12, regionRef: 8, reversed: true, flex: true },
+  ]);
+  const units = parseArrangeUnits(buffer);
+  assert.deepEqual(units.map((u) => u.reversed), [false, true, false, true]);
+  // Reverse and flex live in the same byte but are independent bits.
+  assert.deepEqual(units.map((u) => u.flex), [false, false, true, true]);
+});
+
 test('fades read as milliseconds with signed curves', () => {
   // re_probe13/14: a 1-bar fade-in and a 3-bar fade-out at 120 BPM, eased.
   const buffer = arrangeList([
@@ -221,6 +256,7 @@ test('placement joins units to definitions on regionRef == oid', () => {
     trackNumber: 1,
     gainDb: 0,
     flex: false,
+    reversed: false,
     muted: false,
     fadeInMs: 0,
     fadeOutMs: 0,

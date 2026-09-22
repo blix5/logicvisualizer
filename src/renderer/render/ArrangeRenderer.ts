@@ -335,9 +335,21 @@ export class ArrangeRenderer {
       // Timeline seconds map to SOURCE seconds via the trim-in and the flex
       // stretch: a flexed region consumes sourceRate seconds of audio per second
       // of timeline. Ignoring the rate truncates or overruns a stretched
-      // region's waveform.
-      const from = (x - startX) * secondsPerPixel * sourceRate + region.fileStartSeconds;
-      const to = (x + 1 - startX) * secondsPerPixel * sourceRate + region.fileStartSeconds;
+      // region's waveform. A reversed region maps back-to-front: the source runs
+      // from the trimmed span's end toward its start as x increases, so the drawn
+      // waveform mirrors horizontally.
+      const dtFrom = (x - startX) * secondsPerPixel * sourceRate;
+      const dtTo = (x + 1 - startX) * secondsPerPixel * sourceRate;
+      let from: number;
+      let to: number;
+      if (region.reversed) {
+        const sourceSpan = (region.endSeconds - region.startSeconds) * sourceRate;
+        from = region.fileStartSeconds + sourceSpan - dtTo;
+        to = region.fileStartSeconds + sourceSpan - dtFrom;
+      } else {
+        from = region.fileStartSeconds + dtFrom;
+        to = region.fileStartSeconds + dtTo;
+      }
       let first = Math.floor(from * rate);
       let last = Math.ceil(to * rate);
       if (last <= first) last = first + 1;

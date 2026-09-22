@@ -324,6 +324,7 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
       fileStartSeconds: region.fileStartSamples / sampleRate,
       gainDb: region.gainDb,
       flex: region.flex,
+      reversed: region.reversed,
       muted: region.muted,
       // A fade cannot outlast its region; the dozen in the corpus that claim
       // to are clamped rather than trusted.

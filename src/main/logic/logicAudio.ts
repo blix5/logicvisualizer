@@ -55,6 +55,16 @@ const AURG_OID_OFFSET = 10;
 const AURG_FILE_START_OFFSET = 42;
 /** Enumerates records that share an oid: 0, 1, 2 ... within the group. */
 const AURG_ORDINAL_OFFSET = 14;
+/**
+ * Bit 1 (0x02) of this flags byte is set when the region is muted. Established by
+ * un-muting eight of djpubichair.logicx's "kick 2" copies (bars 65-72) and diffing
+ * the save: exactly those eight AuRg records cleared +41 bit 1 and nothing else in
+ * the file did, taking the project's muted count from 262 to 254. This is where
+ * real projects (Logic Pro 11) keep region mute; the placement's +15 bit 0 is a
+ * second, older location (re_probe12). A region is muted if EITHER is set.
+ */
+const AURG_MUTE_OFFSET = 41;
+const AURG_MUTE_BIT = 0x02;
 const AURG_LENGTH_SAMPLES_OFFSET = 58;
 const AURG_NAME_LEN_OFFSET = 110;
 
@@ -85,6 +95,15 @@ const UNIT_GAIN_DB_OFFSET = 52;
  */
 const UNIT_FLAGS_OFFSET = 48;
 const UNIT_FLEX_BIT = 0x80;
+/**
+ * Bit 5 set when the region plays reversed. Established with djpubichair.logicx's
+ * "crash" track: fifteen placements cut from one file (rref 184), of which the
+ * user reversed exactly seven (bars 8, 24, 32, 48, 64, 72, 104). Those seven read
+ * 0x3c at +48 against the forward ones' 0x1c — a clean single-bit split with the
+ * file, trim and length all identical. Across the project the bit is set on
+ * 245 of 1,871 placements.
+ */
+const UNIT_REVERSE_BIT = 0x20;
 /**
  * Bit 0 set when the region is muted. Established with re_probe12, which mutes
  * only the second of re_probe5's three regions: its +15 goes 0x00 -> 0x81,
@@ -139,6 +158,8 @@ export type LogicAudioRegion = {
   lengthSamples: number;
   /** Where in the source file this region starts, in samples (trim-in). */
   fileStartSamples: number;
+  /** Region mute, stored on the definition (AuRg +41 bit 1) as of Logic Pro 11. */
+  muted: boolean;
 };
 
 export type LogicArrangeUnit = {
@@ -154,6 +175,8 @@ export type LogicArrangeUnit = {
   gainDb: number;
   /** Flex on: the region is time-stretched to follow project tempo. */
   flex: boolean;
+  /** Reverse on: the region plays back-to-front. */
+  reversed: boolean;
   muted: boolean;
   fadeInMs: number;
   fadeOutMs: number;
@@ -218,6 +241,7 @@ export function parseAudioRegions(buffer: Buffer): LogicAudioRegion[] {
       name: buffer.toString('latin1', tagOffset + AURG_NAME_OFFSET, nameEnd),
       lengthSamples: buffer.readUInt32LE(tagOffset + AURG_LENGTH_SAMPLES_OFFSET),
       fileStartSamples: buffer.readUInt32LE(tagOffset + AURG_FILE_START_OFFSET),
+      muted: (buffer.readUInt8(tagOffset + AURG_MUTE_OFFSET) & AURG_MUTE_BIT) !== 0,
     });
   }
   return regions;
@@ -262,6 +286,7 @@ export function parseArrangeUnits(buffer: Buffer, maxTrackNumber = MAX_TRACK_NUM
       ordinal: buffer.readUInt32LE(at + UNIT_ORDINAL_OFFSET),
       gainDb: buffer.readInt8(at + UNIT_GAIN_DB_OFFSET),
       flex: (buffer.readUInt8(at + UNIT_FLAGS_OFFSET) & UNIT_FLEX_BIT) !== 0,
+      reversed: (buffer.readUInt8(at + UNIT_FLAGS_OFFSET) & UNIT_REVERSE_BIT) !== 0,
       muted: (buffer.readUInt8(at + UNIT_MUTE_OFFSET) & UNIT_MUTE_BIT) !== 0,
       fadeInMs: buffer.readUInt16LE(at + UNIT_FADE_IN_MS_OFFSET),
       fadeOutMs: buffer.readUInt16LE(at + UNIT_FADE_OUT_MS_OFFSET),
@@ -285,6 +310,8 @@ export type PlacedAudioRegion = {
   gainDb: number;
   /** Flex on: time-stretched to project tempo, so lengthSamples is NOT its timeline length. */
   flex: boolean;
+  /** Reverse on: the region plays back-to-front. */
+  reversed: boolean;
   muted: boolean;
   fadeInMs: number;
   fadeOutMs: number;
@@ -327,7 +354,11 @@ export function placedAudioRegions(buffer: Buffer, maxTrackNumber?: number): Pla
       trackNumber: unit.trackNumber,
       gainDb: unit.gainDb,
       flex: unit.flex,
-      muted: unit.muted,
+      reversed: unit.reversed,
+      // Region mute lives in two places across Logic versions: the placement
+      // unit (+15 bit 0, re_probe12) and the region definition (AuRg +41 bit 1,
+      // Logic Pro 11's djpubichair). Either marks the region muted.
+      muted: unit.muted || region.muted,
       fadeInMs: unit.fadeInMs,
       fadeOutMs: unit.fadeOutMs,
       fadeInCurve: unit.fadeInCurve,

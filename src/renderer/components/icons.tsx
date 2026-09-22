@@ -37,6 +37,16 @@ export const MusicUploadIcon = () => (
   </Icon>
 );
 
+/** A note with a lightning bolt: render (auto-bounce) in Logic. */
+export const AutoBounceIcon = () => (
+  <Icon>
+    <path d="M6 12V4l5-1.25v6.25" />
+    <circle cx="4.5" cy="12" r="1.5" />
+    <circle cx="9.5" cy="9" r="1.5" />
+    <path d="M13 2.5l-2 3h2l-2 3" />
+  </Icon>
+);
+
 export const PlayIcon = () => (
   <Icon>
     <path d="M5 3.2v9.6L12.5 8z" fill="currentColor" stroke="none" />

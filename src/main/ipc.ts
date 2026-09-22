@@ -10,8 +10,11 @@ import { CHANNELS, type AudioFileBytes, type BounceFile, type RecentPreview, typ
 import type { ProjectModel } from '../shared/model';
 import { buildProjectModel } from './project/buildProject';
 import { resolveLogicPaths } from './logic/logicPaths';
+import { autoBounceProject, BOUNCE_AUDIO_EXTENSIONS } from './bounce/autoBounce';
+import { requestLogicBounceCancel } from './bounce/logicControl';
+import { showBounceProgress } from './bounce/progressWindow';
 
-const BOUNCE_EXTENSIONS = ['wav', 'aif', 'aiff', 'mp3', 'm4a', 'caf', 'flac'];
+const BOUNCE_EXTENSIONS = BOUNCE_AUDIO_EXTENSIONS;
 
 function failure(error: unknown): { error: string } {
   return { error: error instanceof Error ? error.message : String(error) };
@@ -61,6 +64,28 @@ function writeBounceIndex(index: BounceIndex): void {
 }
 function bounceKey(projectPath: string): string {
   return crypto.createHash('sha1').update(projectPath).digest('hex').slice(0, 16);
+}
+
+// Copy an audio file into app storage as the project's saved bounce, replacing
+// any previous one and updating the index. Shared by manual import (bounce:save)
+// and automatic bounce (bounce:auto).
+async function storeBounce(
+  projectPath: string,
+  sourcePath: string,
+): Promise<{ name: string; storedPath: string }> {
+  fs.mkdirSync(bouncesDir(), { recursive: true });
+  const storedName = `${bounceKey(projectPath)}${path.extname(sourcePath) || '.wav'}`;
+  const storedPath = path.join(bouncesDir(), storedName);
+  await fs.promises.copyFile(sourcePath, storedPath);
+  const index = readBounceIndex();
+  const previous = index[projectPath];
+  // A new bounce with a different extension leaves the old file orphaned.
+  if (previous && previous.file !== storedName) {
+    try { await fs.promises.unlink(path.join(bouncesDir(), previous.file)); } catch { /* already gone */ }
+  }
+  index[projectPath] = { file: storedName, name: path.basename(sourcePath), savedAt: Date.now() };
+  writeBounceIndex(index);
+  return { name: path.basename(sourcePath), storedPath };
 }
 
 export function registerIpc(getWindow: () => BrowserWindow | null): void {
@@ -146,20 +171,41 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
   // replacing any bounce previously saved for that project.
   ipcMain.handle(CHANNELS.bounceSave, async (_event, projectPath: string, sourcePath: string) => {
     try {
-      fs.mkdirSync(bouncesDir(), { recursive: true });
-      const storedName = `${bounceKey(projectPath)}${path.extname(sourcePath) || '.wav'}`;
-      await fs.promises.copyFile(sourcePath, path.join(bouncesDir(), storedName));
-      const index = readBounceIndex();
-      const previous = index[projectPath];
-      // A new bounce with a different extension leaves the old file orphaned.
-      if (previous && previous.file !== storedName) {
-        try { await fs.promises.unlink(path.join(bouncesDir(), previous.file)); } catch { /* already gone */ }
-      }
-      index[projectPath] = { file: storedName, name: path.basename(sourcePath), savedAt: Date.now() };
-      writeBounceIndex(index);
-      return { name: path.basename(sourcePath) };
+      const { name } = await storeBounce(projectPath, sourcePath);
+      return { name };
     } catch (error) {
       return failure(error);
+    }
+  });
+
+  // Open the project in Logic Pro and render a full bounce via AppleScript, then
+  // persist it through the same storage as a manual import and hand the bytes
+  // back so the renderer can display it. Focus returns to our window afterward,
+  // since driving Logic's dialogs brought Logic to the front.
+  ipcMain.handle(CHANNELS.bounceAuto, async (_event, projectPath: string): Promise<Result<BounceFile>> => {
+    // An always-on-top overlay tracks progress and is the only way to cancel;
+    // the flag it flips is checked cooperatively between bounce phases.
+    const cancelToken = { cancelled: false };
+    const progress = showBounceProgress(getWindow(), () => {
+      cancelToken.cancelled = true;
+      // Also tell Logic to abort its own render (best effort, non-blocking).
+      requestLogicBounceCancel();
+    });
+    try {
+      const outcome = await autoBounceProject(projectPath, {
+        cancelToken,
+        onStatus: (message) => progress.setStatus(message),
+      });
+      if (!outcome.ok) return { error: outcome.error };
+      const { name, storedPath } = await storeBounce(projectPath, outcome.path);
+      const data = await fs.promises.readFile(storedPath);
+      const bytes = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+      return { path: storedPath, name, bytes };
+    } catch (error) {
+      return failure(error);
+    } finally {
+      progress.finish();
+      try { app.focus({ steal: true }); } catch { /* best effort */ }
     }
   });
 

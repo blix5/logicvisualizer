@@ -240,7 +240,10 @@ export function parseMidiRegions(buffer: Buffer, maxTrackNumber: number): Parsed
       positionTicks: placement.positionTicks,
       lengthTicks: cell.lengthTicks,
       notes: clipNotesToRegion(readRegionNotes(buffer, cell.qsve), cell.lengthTicks),
-      muted: placement.muted,
+      // Region mute lives in two places across Logic versions: the placement
+      // (+8 = 0, re_probe14) and the region cell definition (+0x4e bit 0, Logic
+      // Pro 11's djpubichair). Either marks the region muted.
+      muted: placement.muted || cell.muted,
     });
   }
   return regions;
