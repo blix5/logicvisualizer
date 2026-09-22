@@ -2,7 +2,7 @@
 // grid and the toolbar dropdown that show it. Thumbnails come from the
 // WindowImage.jpg inside each .logicx bundle, read on demand via project.preview
 // and cached in memory for the session (never stored — the images are large).
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import type { RecentPreview } from '../../shared/ipc';
 import { isFailure } from '../../shared/ipc';
 import { CloseIcon, FolderIcon } from './icons';
@@ -81,7 +81,7 @@ function useProjectPreview(path: string): RecentPreview | undefined {
     let cancelled = false;
     void window.lv.project.preview(path).then((result) => {
       if (cancelled) return;
-      previewCache.set(path, isFailure(result) ? { exists: false, dataUrl: null } : result);
+      previewCache.set(path, isFailure(result) ? { exists: false, dataUrl: null, hasBounce: false } : result);
       bump((n) => n + 1);
     });
     return () => { cancelled = true; };
@@ -104,12 +104,26 @@ type CardProps = {
   dense?: boolean;
   onOpen: (path: string) => void;
   onRemove: (path: string) => void;
+  onBounceCleared?: (path: string) => void;
 };
 
-function RecentCard({ entry, dense, onOpen, onRemove }: CardProps): JSX.Element {
+function RecentCard({ entry, dense, onOpen, onRemove, onBounceCleared }: CardProps): JSX.Element {
   const preview = useProjectPreview(entry.path);
+  const [bounceCleared, setBounceCleared] = useState(false);
   const unavailable = preview?.exists === false;
   const dataUrl = preview?.dataUrl ?? null;
+  const hasBounce = (preview?.hasBounce ?? false) && !bounceCleared;
+
+  const clearBounce = useCallback(async (event: ReactMouseEvent) => {
+    event.stopPropagation();
+    const result = await window.lv.bounce.clear(entry.path);
+    if (isFailure(result)) return;
+    setBounceCleared(true);
+    // Keep the session cache honest so the chip stays gone on re-mount.
+    const cached = previewCache.get(entry.path);
+    if (cached) previewCache.set(entry.path, { ...cached, hasBounce: false });
+    onBounceCleared?.(entry.path);
+  }, [entry.path, onBounceCleared]);
 
   return (
     <div className={`recent-card${dense ? ' dense' : ''}${unavailable ? ' unavailable' : ''}`}>
@@ -123,6 +137,20 @@ function RecentCard({ entry, dense, onOpen, onRemove }: CardProps): JSX.Element 
             ? <img src={dataUrl} alt="" draggable={false} />
             : <span className="recent-thumb-placeholder"><FolderIcon /></span>}
           {unavailable && <span className="recent-badge">unavailable</span>}
+          {hasBounce && (
+            <span
+              className="recent-bounce"
+              role="button"
+              tabIndex={0}
+              onClick={clearBounce}
+              onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') void clearBounce(event as unknown as ReactMouseEvent); }}
+              title="Clear saved bounce"
+              aria-label={`Clear saved bounce for ${entry.name}`}
+            >
+              <span className="recent-bounce-text">bounce</span>
+              <CloseIcon />
+            </span>
+          )}
         </span>
         <span className="recent-meta">
           <span className="recent-name">{entry.name}</span>
@@ -145,15 +173,16 @@ type GridProps = {
   recents: RecentProject[];
   onOpen: (path: string) => void;
   onRemove: (path: string) => void;
+  onBounceCleared?: (path: string) => void;
 };
 
 /** The empty-screen quick-access grid. Renders nothing when there are no recents. */
-export function RecentGrid({ recents, onOpen, onRemove }: GridProps): JSX.Element | null {
+export function RecentGrid({ recents, onOpen, onRemove, onBounceCleared }: GridProps): JSX.Element | null {
   if (recents.length === 0) return null;
   return (
     <div className="recent-grid">
       {recents.map((entry) => (
-        <RecentCard key={entry.path} entry={entry} onOpen={onOpen} onRemove={onRemove} />
+        <RecentCard key={entry.path} entry={entry} onOpen={onOpen} onRemove={onRemove} onBounceCleared={onBounceCleared} />
       ))}
     </div>
   );
@@ -164,11 +193,12 @@ type MenuProps = {
   onOpen: (path: string) => void;
   onRemove: (path: string) => void;
   onOpenNew: () => void;
+  onBounceCleared?: (path: string) => void;
   disabled?: boolean;
 };
 
 /** The toolbar folder button and its recents dropdown. */
-export function RecentMenu({ recents, onOpen, onRemove, onOpenNew, disabled }: MenuProps): JSX.Element {
+export function RecentMenu({ recents, onOpen, onRemove, onOpenNew, onBounceCleared, disabled }: MenuProps): JSX.Element {
   const [open, setOpen] = useState(false);
   // The toolbar clips its overflow, so the panel is positioned fixed, anchored to
   // the button's on-screen rect rather than nested in the (clipped) toolbar flow.
@@ -222,7 +252,7 @@ export function RecentMenu({ recents, onOpen, onRemove, onOpenNew, disabled }: M
           {recents.length > 0 && (
             <div className="recent-menu-list">
               {recents.map((entry) => (
-                <RecentCard key={entry.path} entry={entry} dense onOpen={handleOpen} onRemove={onRemove} />
+                <RecentCard key={entry.path} entry={entry} dense onOpen={handleOpen} onRemove={onRemove} onBounceCleared={onBounceCleared} />
               ))}
             </div>
           )}

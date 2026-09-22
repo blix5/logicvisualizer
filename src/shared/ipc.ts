@@ -28,6 +28,8 @@ export type AudioFileBytes = {
 export type RecentPreview = {
   exists: boolean;
   dataUrl: string | null;
+  /** Whether a bounce has been saved for this project. */
+  hasBounce: boolean;
 };
 
 export type LvApi = {
@@ -40,6 +42,12 @@ export type LvApi = {
   bounce: {
     pick(): Promise<string | null>;
     read(filePath: string): Promise<Result<BounceFile>>;
+    /** Copies the picked bounce into app storage, keyed to the project. */
+    save(projectPath: string, sourcePath: string): Promise<Result<{ name: string }>>;
+    /** The bounce saved for a project, or null when there is none. */
+    saved(projectPath: string): Promise<Result<BounceFile | null>>;
+    /** Forgets and deletes a project's saved bounce. */
+    clear(projectPath: string): Promise<Result<{ cleared: boolean }>>;
   };
   audio: {
     /** Reads a media file from the open project. Path must be inside the bundle. */
@@ -53,5 +61,8 @@ export const CHANNELS = {
   projectPreview: 'project:preview',
   bouncePick: 'bounce:pick',
   bounceRead: 'bounce:read',
+  bounceSave: 'bounce:save',
+  bounceSaved: 'bounce:saved',
+  bounceClear: 'bounce:clear',
   audioRead: 'audio:read',
 } as const;

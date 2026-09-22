@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { isFailure } from '../shared/ipc';
+import { isFailure, type BounceFile } from '../shared/ipc';
 import type { ProjectModel } from '../shared/model';
 import { bpmAtBeat, buildBarGrid, buildTempoMap, secondsToBeats } from '../shared/timebase';
 import { PeakStore } from './audio/PeakStore';
@@ -203,12 +203,47 @@ export function App(): JSX.Element {
     transcriptStoreRef.current?.start();
   }, [convertAudio, project, ensureClock]);
 
+  // Decodes bounce bytes, loads them onto the transport, and kicks off the
+  // waveform reduction. Shared by manual import and the saved-bounce auto-load.
+  const applyBounce = useCallback(async (bounce: BounceFile): Promise<boolean> => {
+    const clock = ensureClock();
+    const ctx = audioCtxRef.current;
+    if (!ctx) return false;
+    try {
+      const buffer = await ctx.decodeAudioData(bounce.bytes);
+      clock.setBuffer(buffer);
+      bouncePeaksRef.current = null;
+      bounceGenerationRef.current += 1;
+      const generation = bounceGenerationRef.current;
+      dirtyRef.current += 1;
+      setBounceName(bounce.name);
+      void reduceBufferPeaks(buffer).then((pyramid) => {
+        if (generation !== bounceGenerationRef.current) return;
+        bouncePeaksRef.current = pyramid;
+        dirtyRef.current += 1;
+      }).catch(() => { /* the roll just shows no bounce waveform */ });
+      setStatus(`Bounce: ${bounce.name} (${buffer.duration.toFixed(1)}s)`);
+      return true;
+    } catch (decodeError) {
+      setError(`Could not decode ${bounce.name}: ${(decodeError as Error).message}`);
+      return false;
+    }
+  }, [ensureClock]);
+
+  // Drops any bounce carried over from a previously open project.
+  const clearBounce = useCallback(() => {
+    clockRef.current?.setBuffer(null);
+    bouncePeaksRef.current = null;
+    bounceGenerationRef.current += 1;
+    dirtyRef.current += 1;
+    setBounceName(null);
+  }, []);
+
   const loadProject = useCallback(async (selectionPath: string) => {
     setBusy(true);
     setError(null);
     const result = await window.lv.project.load(selectionPath);
-    setBusy(false);
-    if (isFailure(result)) { setError(result.error); return; }
+    if (isFailure(result)) { setBusy(false); setError(result.error); return; }
     setProject(result);
     scrollTopRef.current = 0;
     ensureClock().seek(0);
@@ -216,7 +251,12 @@ export function App(): JSX.Element {
     queueTranscripts(result);
     recordRecent({ path: result.projectPath, name: result.projectName, lastOpened: Date.now() });
     setStatus(`Loaded ${result.projectName}`);
-  }, [ensureClock, queueTranscripts, recordRecent]);
+    // Bring back this project's saved bounce, or clear a prior project's.
+    const saved = await window.lv.bounce.saved(result.projectPath);
+    if (!isFailure(saved) && saved) await applyBounce(saved);
+    else clearBounce();
+    setBusy(false);
+  }, [ensureClock, queueTranscripts, recordRecent, applyBounce, clearBounce]);
 
   const openProject = useCallback(async () => {
     const picked = await window.lv.project.pick();
@@ -247,31 +287,11 @@ export function App(): JSX.Element {
     setBusy(true);
     const result = await window.lv.bounce.read(picked);
     if (isFailure(result)) { setBusy(false); setError(result.error); return; }
-    const clock = ensureClock();
-    const ctx = audioCtxRef.current;
-    if (!ctx) { setBusy(false); return; }
-    try {
-      const buffer = await ctx.decodeAudioData(result.bytes);
-      clock.setBuffer(buffer);
-      bouncePeaksRef.current = null;
-      bounceGenerationRef.current += 1;
-      const generation = bounceGenerationRef.current;
-      dirtyRef.current += 1;
-      setBounceName(result.name);
-      // Reduced off the main thread; the strip fills in when it lands. A later
-      // import may have replaced this bounce by then.
-      void reduceBufferPeaks(buffer).then((pyramid) => {
-        if (generation !== bounceGenerationRef.current) return;
-        bouncePeaksRef.current = pyramid;
-        dirtyRef.current += 1;
-      }).catch(() => { /* the roll just shows no bounce waveform */ });
-      setStatus(`Bounce: ${result.name} (${buffer.duration.toFixed(1)}s)`);
-    } catch (decodeError) {
-      setError(`Could not decode ${result.name}: ${(decodeError as Error).message}`);
-    } finally {
-      setBusy(false);
-    }
-  }, [ensureClock]);
+    const ok = await applyBounce(result);
+    setBusy(false);
+    // Save it against the open project so it returns automatically next time.
+    if (ok && project) void window.lv.bounce.save(project.projectPath, result.path);
+  }, [applyBounce, project]);
 
   // Renderer setup + resize.
   useEffect(() => {
@@ -467,6 +487,7 @@ export function App(): JSX.Element {
             <button className="primary open" onClick={() => void openProject()} disabled={busy}>
               Open new .logicx
             </button>
+            {/* No project is open here, so a cleared bounce cannot be the live one. */}
             <RecentGrid recents={recents} onOpen={openRecent} onRemove={removeRecent} />
             <p>
               Open a <code>.logicx</code> project, then import a bounced mixdown of it.
@@ -490,6 +511,7 @@ export function App(): JSX.Element {
               onOpen={openRecent}
               onRemove={removeRecent}
               onOpenNew={() => void openProject()}
+              onBounceCleared={(path) => { if (project?.projectPath === path) clearBounce(); }}
               disabled={busy}
             />
             <button className="icon" onClick={() => void reloadProject()} disabled={!project || busy} title="Reload project" aria-label="Reload project">
@@ -504,6 +526,9 @@ export function App(): JSX.Element {
             >
               <MusicUploadIcon />
             </button>
+
+            {/* Separates the file controls from the transport controls. */}
+            <span className="toolbar-sep" aria-hidden="true" />
 
             <button className="icon" onClick={togglePlay} disabled={!project} title={playing ? 'Pause (Space)' : 'Play (Space)'} aria-label={playing ? 'Pause' : 'Play'}>
               {playing ? <PauseIcon /> : <PlayIcon />}

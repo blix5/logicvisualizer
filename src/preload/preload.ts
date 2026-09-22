@@ -10,6 +10,9 @@ const api: LvApi = {
   bounce: {
     pick: () => ipcRenderer.invoke(CHANNELS.bouncePick),
     read: (filePath) => ipcRenderer.invoke(CHANNELS.bounceRead, filePath),
+    save: (projectPath, sourcePath) => ipcRenderer.invoke(CHANNELS.bounceSave, projectPath, sourcePath),
+    saved: (projectPath) => ipcRenderer.invoke(CHANNELS.bounceSaved, projectPath),
+    clear: (projectPath) => ipcRenderer.invoke(CHANNELS.bounceClear, projectPath),
   },
   audio: {
     read: (filePath) => ipcRenderer.invoke(CHANNELS.audioRead, filePath),

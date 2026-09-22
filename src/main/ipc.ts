@@ -1,11 +1,12 @@
 // All ipcMain handlers. Handlers never throw across the boundary — they return
 // { error } so the renderer always has something to show.
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { BrowserWindow, dialog, ipcMain, nativeImage } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, nativeImage } from 'electron';
 
-import { CHANNELS, type AudioFileBytes, type BounceFile, type RecentPreview } from '../shared/ipc';
+import { CHANNELS, type AudioFileBytes, type BounceFile, type RecentPreview, type Result } from '../shared/ipc';
 import type { ProjectModel } from '../shared/model';
 import { buildProjectModel } from './project/buildProject';
 import { resolveLogicPaths } from './logic/logicPaths';
@@ -33,6 +34,33 @@ function logicProjectsFolder(): string {
   const music = path.join(os.homedir(), 'Music');
   const logic = path.join(music, 'Logic');
   return fs.existsSync(logic) ? logic : music;
+}
+
+// Saved bounces live in app storage, one copy per project, so a project's
+// mixdown comes back on reopen even if the original file is moved or deleted.
+// An index maps the project's bundle path to the stored file's basename.
+type BounceIndex = Record<string, { file: string; name: string; savedAt: number }>;
+
+function bouncesDir(): string {
+  return path.join(app.getPath('userData'), 'bounces');
+}
+function bounceIndexPath(): string {
+  return path.join(bouncesDir(), 'index.json');
+}
+function readBounceIndex(): BounceIndex {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(bounceIndexPath(), 'utf8')) as unknown;
+    return parsed && typeof parsed === 'object' ? (parsed as BounceIndex) : {};
+  } catch {
+    return {};
+  }
+}
+function writeBounceIndex(index: BounceIndex): void {
+  fs.mkdirSync(bouncesDir(), { recursive: true });
+  fs.writeFileSync(bounceIndexPath(), JSON.stringify(index, null, 2));
+}
+function bounceKey(projectPath: string): string {
+  return crypto.createHash('sha1').update(projectPath).digest('hex').slice(0, 16);
 }
 
 export function registerIpc(getWindow: () => BrowserWindow | null): void {
@@ -69,22 +97,25 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
   // the read confined to it. Never throws across the boundary: a project that has
   // moved or has no window image comes back with exists/dataUrl set accordingly.
   ipcMain.handle(CHANNELS.projectPreview, async (_event, projectPath: string): Promise<RecentPreview> => {
+    // A saved bounce is tracked independently of the bundle, so a moved project
+    // can still report one (and offer to clear it).
+    const hasBounce = !!readBounceIndex()[projectPath];
     try {
       const paths = resolveLogicPaths(projectPath);
-      if (!paths.projectDataPath) return { exists: false, dataUrl: null };
-      if (!paths.windowImagePath) return { exists: true, dataUrl: null };
+      if (!paths.projectDataPath) return { exists: false, dataUrl: null, hasBounce };
+      if (!paths.windowImagePath) return { exists: true, dataUrl: null, hasBounce };
       try {
         const raw = await fs.promises.readFile(paths.windowImagePath);
         const thumb = nativeImage.createFromBuffer(raw).resize({ width: 480, quality: 'good' });
         const dataUrl = `data:image/jpeg;base64,${thumb.toJPEG(72).toString('base64')}`;
-        return { exists: true, dataUrl };
+        return { exists: true, dataUrl, hasBounce };
       } catch {
         // The bundle is fine; only the image could not be read or decoded.
-        return { exists: true, dataUrl: null };
+        return { exists: true, dataUrl: null, hasBounce };
       }
     } catch {
       // Not a resolvable .logicx anymore (moved, deleted, or never valid).
-      return { exists: false, dataUrl: null };
+      return { exists: false, dataUrl: null, hasBounce };
     }
   });
 
@@ -106,6 +137,67 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
       const bytes = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
       const bounce: BounceFile = { path: filePath, name: path.basename(filePath), bytes };
       return bounce;
+    } catch (error) {
+      return failure(error);
+    }
+  });
+
+  // Copy the picked bounce into app storage under a project-derived name,
+  // replacing any bounce previously saved for that project.
+  ipcMain.handle(CHANNELS.bounceSave, async (_event, projectPath: string, sourcePath: string) => {
+    try {
+      fs.mkdirSync(bouncesDir(), { recursive: true });
+      const storedName = `${bounceKey(projectPath)}${path.extname(sourcePath) || '.wav'}`;
+      await fs.promises.copyFile(sourcePath, path.join(bouncesDir(), storedName));
+      const index = readBounceIndex();
+      const previous = index[projectPath];
+      // A new bounce with a different extension leaves the old file orphaned.
+      if (previous && previous.file !== storedName) {
+        try { await fs.promises.unlink(path.join(bouncesDir(), previous.file)); } catch { /* already gone */ }
+      }
+      index[projectPath] = { file: storedName, name: path.basename(sourcePath), savedAt: Date.now() };
+      writeBounceIndex(index);
+      return { name: path.basename(sourcePath) };
+    } catch (error) {
+      return failure(error);
+    }
+  });
+
+  // The bounce saved for a project, read back from app storage. Returns null
+  // (not a failure) when the project has no saved bounce, and forgets an entry
+  // whose stored file has since disappeared.
+  ipcMain.handle(CHANNELS.bounceSaved, async (_event, projectPath: string): Promise<Result<BounceFile | null>> => {
+    try {
+      const index = readBounceIndex();
+      const entry = index[projectPath];
+      if (!entry) return null;
+      const stored = path.join(bouncesDir(), entry.file);
+      let data: Buffer;
+      try {
+        data = await fs.promises.readFile(stored);
+      } catch {
+        delete index[projectPath];
+        try { writeBounceIndex(index); } catch { /* best effort */ }
+        return null;
+      }
+      const bytes = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+      const bounce: BounceFile = { path: stored, name: entry.name, bytes };
+      return bounce;
+    } catch (error) {
+      return failure(error);
+    }
+  });
+
+  // Delete a project's saved bounce and forget its index entry.
+  ipcMain.handle(CHANNELS.bounceClear, async (_event, projectPath: string) => {
+    try {
+      const index = readBounceIndex();
+      const entry = index[projectPath];
+      if (!entry) return { cleared: false };
+      try { await fs.promises.unlink(path.join(bouncesDir(), entry.file)); } catch { /* already gone */ }
+      delete index[projectPath];
+      writeBounceIndex(index);
+      return { cleared: true };
     } catch (error) {
       return failure(error);
     }

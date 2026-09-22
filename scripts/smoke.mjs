@@ -5,13 +5,29 @@ import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 const PORT = 9222;
+// detached makes the child a process-group leader, so `npm start` and every
+// process it spawns (electron-forge, Vite, the Electron app) share one group.
 const child = spawn('npm', ['start'], {
   env: { ...process.env, LV_DEBUG_PORT: String(PORT) },
   stdio: ['ignore', 'pipe', 'pipe'],
+  detached: true,
 });
 let log = '';
 child.stdout.on('data', (d) => { log += d; });
 child.stderr.on('data', (d) => { log += d; });
+
+// Kill the whole group, not just `npm`: a bare child.kill() leaves the detached
+// Electron app running, and repeated runs pile up orphans that starve the GPU.
+let killed = false;
+function killTree(signal = 'SIGKILL') {
+  if (killed || child.pid === undefined) return;
+  killed = true;
+  try { process.kill(-child.pid, signal); }
+  catch { try { child.kill(signal); } catch { /* already gone */ } }
+}
+// Backstop for an unexpected throw or Ctrl-C between here and the explicit kill.
+process.on('exit', () => killTree());
+process.on('SIGINT', () => { killTree(); process.exit(130); });
 
 async function targets() {
   const res = await fetch(`http://127.0.0.1:${PORT}/json/list`);
@@ -25,7 +41,7 @@ for (let i = 0; i < 60 && !page; i += 1) {
     page = (await targets()).find((t) => t.type === 'page' && t.url.includes('localhost'));
   } catch { /* devtools not up yet */ }
 }
-if (!page) { console.error('FAIL: no page target\n' + log); child.kill(); process.exit(1); }
+if (!page) { console.error('FAIL: no page target\n' + log); killTree(); process.exit(1); }
 
 const ws = new (await import('ws')).default(page.webSocketDebuggerUrl);
 await new Promise((resolve) => ws.on('open', resolve));
@@ -103,6 +119,6 @@ const errors = log.split('\n').filter((l) => (
 if (errors.length) { console.error('FAIL: renderer errors:\n' + errors.join('\n')); ok = false; }
 
 ws.close();
-child.kill('SIGTERM');
+killTree();
 console.log(ok ? '\nSMOKE PASS' : '\nSMOKE FAIL');
 process.exit(ok ? 0 : 1);
