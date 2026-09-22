@@ -219,6 +219,7 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
       noteCount: parsed.notes.length,
       pitchMin: pitchMin <= pitchMax ? pitchMin : 60,
       pitchMax: pitchMax >= pitchMin ? pitchMax : 72,
+      muted: parsed.muted,
     };
     regions.push(region);
   }
@@ -323,6 +324,13 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
       fileStartSeconds: region.fileStartSamples / sampleRate,
       gainDb: region.gainDb,
       flex: region.flex,
+      muted: region.muted,
+      // A fade cannot outlast its region; the dozen in the corpus that claim
+      // to are clamped rather than trusted.
+      fadeInSeconds: Math.min(region.fadeInMs / 1000, endSecondsForRegion - startSeconds),
+      fadeOutSeconds: Math.min(region.fadeOutMs / 1000, endSecondsForRegion - startSeconds),
+      fadeInCurve: Math.max(-1, Math.min(1, region.fadeInCurve / 99)),
+      fadeOutCurve: Math.max(-1, Math.min(1, region.fadeOutCurve / 99)),
       sourceRate,
       lengthApproximate: false,
     });

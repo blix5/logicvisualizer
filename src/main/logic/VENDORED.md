@@ -239,6 +239,35 @@ re_probe8, which mutes exactly tracks 2 and 3: the flag is set on those two and
 on no channel of re_probe6 or re_probe7, which mute nothing. A rival candidate at
 `+117` bit 3 was **rejected** — it fires on the unmuted probes too.
 
+### Region mute and fades — solved
+
+Three probes, all built on re_probe5 (three audio regions on one track, 120 BPM):
+
+| Probe | Edit | Byte evidence |
+|---|---|---|
+| 12 | region 2 muted | its unit `+15`: `0x00` → `0x81` |
+| 13 | 1-bar fade-in on region 1, 3-bar fade-out on region 3 | unit `+76` u16 = 1999, unit `+72` u16 = 5995 |
+| 14 | those fades set to ease in / ease out; a MIDI track with a region at bar 5 and an identical **muted** copy at bar 13 | `+79` = 98, `+75` = 99; the muted MIDI unit has `+8` = 0 |
+
+**Audio mute is `+15` bit 0.** Bit 7 of the same byte is set on a merely
+*selected* region (re_probe13 reads `0x80` there), so test the bit, not the
+byte. Across ~/Music/Logic it is set on 2 of 13,797 placements.
+
+**Fades are u16 milliseconds, each followed a byte later by an i8 curve**
+(-99..99, 0 linear): fade-out at `+72` with its curve at `+75`, fade-in at `+76`
+with its curve at `+79`. 1999 and 5995 are 2 s and 6 s as dragged — one and
+three bars at 120 BPM. Across the corpus 2,223 placements have a fade-in and
+3,237 a fade-out; all but 12 fit inside their region (those are clamped). The
+commonest value is a 17 ms fade-out — Logic's anti-click fade. Logic's exact
+curve taper is not decoded; the renderer uses a power curve of the same shape.
+
+**MIDI mute clears `+8` and keeps `+32`.** The parser used to require the two
+refs to agree, so it silently **dropped every muted MIDI region** (26 across the
+corpus, re_probe14's included). A per-track record at bar 1 has the same shape
+(`+8` = 0, `+32` set), but its `+32` names no region cell, so the cell join
+drops it; the four that did land on a cell were nameless, noteless and
+near-zero length, and a one-sixteenth minimum length rejects them.
+
 ### Automation — solved
 
 Automation lives in its own `qSvE` whose payload is a whole number of 16-byte
@@ -285,8 +314,6 @@ The fader-to-dB taper is only calibrated at two points (90 = 0 dB, 0 = -inf), so
   That is unconfirmed: its placement record is byte-identical to an ordinary one
   apart from position and ordinal, so the loop flag, if that is what it is,
   lives elsewhere. A probe that loops one region would settle it.
-- **Region fades** (in/out). Clip gain, trim-in, length, mute, volume and pan
-  are all decoded; fades are not.
 - **MIDI region selection when cell oids collide** — 0.7% of placements. Audio
   solves this with the placement's `+40` ordinal; MIDI has no known equivalent.
 - **MIDI start-trim**, if it exists. No region in the corpus has notes starting

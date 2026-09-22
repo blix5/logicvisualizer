@@ -118,3 +118,25 @@ test('tempo changes and curves are decoded', { skip: (() => {
   assert.ok(ramp.length > 5, 'intermediate points between anchors');
   assert.ok(ramp.every((e, i) => i === 0 || e.bpm >= ramp[i - 1].bpm), 'monotonic ramp');
 });
+
+const probe = (name) => path.join(process.env.LV_PROJECTS_DIR ?? path.join(os.homedir(), 'Music', 'Logic'), `${name}.logicx`);
+
+test('region mute and fades decode from the probes that isolate them', {
+  skip: !['re_probe12', 're_probe13', 're_probe14'].every((n) => fs.existsSync(probe(n))) && 're_probe12-14 not found',
+}, () => {
+  // re_probe12: only the second of three regions is muted.
+  const muted = buildProjectModel(probe('re_probe12')).regions.map((r) => r.muted);
+  assert.deepEqual(muted, [false, true, false]);
+
+  // re_probe13: 1-bar fade-in on region 1, 3-bar fade-out on region 3, at 120 BPM.
+  const fades = buildProjectModel(probe('re_probe13')).regions
+    .map((r) => [Math.round(r.fadeInSeconds), Math.round(r.fadeOutSeconds)]);
+  assert.deepEqual(fades, [[2, 0], [0, 0], [0, 6]]);
+
+  // re_probe14: the same fades eased, and a muted MIDI copy at bar 13.
+  const model = buildProjectModel(probe('re_probe14'));
+  const audio = model.regions.filter((r) => r.kind === 'audio');
+  assert.ok(audio[0].fadeInCurve > 0.9 && audio[2].fadeOutCurve > 0.9);
+  const midi = model.regions.filter((r) => r.kind === 'midi');
+  assert.deepEqual(midi.map((r) => [Math.round(r.startSeconds), r.muted]), [[8, false], [24, true]]);
+});

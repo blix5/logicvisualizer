@@ -1,6 +1,5 @@
-// Mode-agnostic scene model, built once per (project, layout) change.
-// Both renderers consume it, which is what makes the Arrange/Stylized toggle
-// cheap: the geometry is identical, only the drawing differs.
+// Lane scene model for the Arrange view, built once per (project, layout)
+// change. (The piano roll builds its own lane-free scene; see rollScene.ts.)
 //
 // This is also where per-frame work is bought down. Anything that depends only
 // on the project and the lane layout — note times in seconds, note y offsets,
@@ -46,6 +45,8 @@ export type LaneLayout = {
   trackId: string;
   name: string;
   color: string;
+  /** Track mute: every region on the lane draws as muted. */
+  muted: boolean;
   top: number;
   height: number;
   /** Regions on this lane, sorted by startSeconds, for binary-search culling. */
@@ -147,6 +148,7 @@ export function buildScene(model: ProjectModel, config: LaneLayoutConfig): Scene
       trackId: track.id,
       name: track.name,
       color: track.color,
+      muted: track.muted,
       top,
       height: config.laneHeight,
       regions,

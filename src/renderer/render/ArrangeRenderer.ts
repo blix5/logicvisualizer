@@ -4,20 +4,18 @@
 // translates underneath it. Only the visible time window is drawn — regions and
 // notes are both found by binary search and culled against that window.
 //
-// Stylized mode is the expensive one, so three rules keep it affordable:
-//   1. No per-shape shadow blur. Blur forces an offscreen gaussian pass and is
-//      costed on the shape's full bounds, which for a region rect can be tens
-//      of thousands of pixels wide. The region glow is a cached vertical
-//      gradient instead; only the handful of notes under the playhead still
-//      blur, and that count is capped.
-//   2. Notes are batched by velocity bucket and flushed once per lane, so a
+// Two rules keep a dense arrangement affordable:
+//   1. Notes are batched by velocity bucket and flushed once per lane, so a
 //      lane costs ~8 fillStyle changes instead of one per note. Assigning
 //      fillStyle reparses a CSS colour string, which dominated the note loop.
-//   3. Blurred and gradient fills are clamped to the viewport plus a margin.
+//   2. Region and note fills are clamped to the viewport plus a margin: a
+//      region is as wide as it is long, which at high zoom is enormous.
 import type { AudioRegionModel, RegionModel } from '../../shared/model';
 import type { BarGridEntry } from '../../shared/timebase';
 import { levelForPixelsPerSecond, peakCount, type PeakPyramid } from './peaks';
+import { fadeGain, hasFade } from './fade';
 import { RectBuffer } from './rectBuffer';
+import type { SpectrumMode } from './spectrum';
 import {
   NOTE_FIELDS,
   VELOCITY_BUCKETS,
@@ -28,7 +26,7 @@ import {
   type Scene,
 } from './scene';
 
-export type RenderMode = 'arrange' | 'stylized' | 'roll';
+export type RenderMode = 'arrange' | 'roll';
 
 /** dB per FFT bin for each channel of the bounce, as AnalyserNode reports it. */
 export type StereoSpectrum = { left: Float32Array; right: Float32Array; sampleRate: number };
@@ -49,19 +47,29 @@ export type ViewState = {
   bouncePeaks?: PeakPyramid | null;
   /** Bounce seconds minus project seconds; places the bounce on the timeline. */
   bounceOffset?: number;
-  /** Live analyser output per channel, for the piano roll's spectrum lines. */
+  /** Live analyser output per channel, for the piano roll's spectrum views. */
   spectrum?: StereoSpectrum | null;
+  /** Which spectrum view the piano roll draws over everything. */
+  spectrumMode?: SpectrumMode;
+  /** True while audio is playing: the spectrogram trail only records then. */
+  spectrumLive?: boolean;
+  /**
+   * Pixels at the top covered by the floating toolbar. Arrange starts below it
+   * so the ruler stays readable; the piano roll draws underneath on purpose.
+   */
+  topInset?: number;
 };
 
 const LANE_LABEL_WIDTH = 168;
 const RULER_HEIGHT = 26;
-/** Vertical reach of the stylized region glow, above and below the lane. */
-const GLOW_PAD = 22;
-const NOTE_BLUR = 18;
-/** Past this many notes under the playhead at once, the flash drops its blur. */
-const MAX_BLURRED_FLASHES = 48;
-/** Clamp margin for fills whose paint spreads beyond the rect. */
-const EDGE_MARGIN = GLOW_PAD + 8;
+/**
+ * Muted regions draw in this grey instead of their track colour, as Logic
+ * greys them. An hsl() string so the alpha helpers treat it like any track.
+ */
+const MUTED_COLOR = 'hsl(220 8% 52%)';
+/** Clamp margin, so clamped fills never show an edge inside the viewport. */
+const EDGE_MARGIN = 8;
+const BACKGROUND = '#0b0d12';
 
 export function withAlpha(color: string, alpha: number): string {
   // Track colours are hsl(...) strings; hsl() accepts a slash-alpha suffix.
@@ -74,13 +82,12 @@ export class ArrangeRenderer {
   private dpr = 1;
 
   private readonly alphaCache = new Map<string, string>();
-  private readonly glowCache = new Map<string, CanvasGradient>();
   private readonly noteBuckets: RectBuffer[] =
     Array.from({ length: VELOCITY_BUCKETS }, () => new RectBuffer());
-  private readonly flashes = new RectBuffer();
   private readonly waveform = new RectBuffer();
-  private playheadGradient: CanvasGradient | null = null;
-  private playheadGradientKey = '';
+  /** Muted regions' notes and waveforms, flushed together in grey. */
+  private readonly mutedNotes = new RectBuffer();
+  private readonly mutedWaveform = new RectBuffer();
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -95,7 +102,6 @@ export class ArrangeRenderer {
     this.canvas.height = Math.max(1, Math.round(height * dpr));
     this.canvas.style.width = `${width}px`;
     this.canvas.style.height = `${height}px`;
-    this.playheadGradient = null;
   }
 
   private shade(color: string, alpha: number): string {
@@ -108,50 +114,29 @@ export class ArrangeRenderer {
     return value;
   }
 
-  /**
-   * The stylized glow, as a gradient rather than a shadow. Defined in a local
-   * space of 0..(laneHeight + 2 * GLOW_PAD) so one gradient serves every lane;
-   * the caller translates to the lane before filling.
-   */
-  private glow(color: string, laneHeight: number, active: boolean): CanvasGradient {
-    const key = `${color}|${laneHeight}|${active ? 1 : 0}`;
-    const cached = this.glowCache.get(key);
-    if (cached) return cached;
-
-    const height = laneHeight + GLOW_PAD * 2;
-    const edge = GLOW_PAD / height;
-    const peak = active ? 0.34 : 0.18;
-    const gradient = this.ctx.createLinearGradient(0, 0, 0, height);
-    gradient.addColorStop(0, withAlpha(color, 0));
-    gradient.addColorStop(edge * 0.55, withAlpha(color, peak * 0.3));
-    gradient.addColorStop(edge, withAlpha(color, peak));
-    gradient.addColorStop(1 - edge, withAlpha(color, peak));
-    gradient.addColorStop(1 - edge * 0.55, withAlpha(color, peak * 0.3));
-    gradient.addColorStop(1, withAlpha(color, 0));
-    this.glowCache.set(key, gradient);
-    return gradient;
-  }
-
   /** Paints the background only. Used before a project is open. */
-  clear(mode: RenderMode): void {
+  clear(): void {
     const width = this.canvas.width / this.dpr;
     const height = this.canvas.height / this.dpr;
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    this.ctx.fillStyle = mode === 'arrange' ? '#0b0d12' : '#05060a';
+    this.ctx.fillStyle = BACKGROUND;
     this.ctx.fillRect(0, 0, width, height);
   }
 
   draw(scene: Scene, view: ViewState): void {
     const { ctx } = this;
     const width = this.canvas.width / this.dpr;
-    const height = this.canvas.height / this.dpr;
-    const stylized = view.mode === 'stylized';
+    const inset = view.topInset ?? 0;
+    const height = this.canvas.height / this.dpr - inset;
 
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
     ctx.shadowBlur = 0;
-    ctx.fillStyle = stylized ? '#05060a' : '#0b0d12';
-    ctx.fillRect(0, 0, width, height);
+    ctx.fillStyle = BACKGROUND;
+    ctx.fillRect(0, 0, width, height + inset);
+    // Everything below is laid out from y = 0 as before, just shifted down.
+    ctx.translate(0, inset);
 
     const centreX = width / 2;
     const secondsPerPixel = 1 / view.pixelsPerSecond;
@@ -159,7 +144,7 @@ export class ArrangeRenderer {
     const windowEnd = view.playheadSeconds + (width - centreX) * secondsPerPixel;
     const toX = (seconds: number) => centreX + (seconds - view.playheadSeconds) * view.pixelsPerSecond;
 
-    this.drawBarGrid(view, toX, width, height, windowStart, windowEnd, stylized);
+    this.drawBarGrid(view, toX, width, height, windowStart, windowEnd);
 
     ctx.save();
     ctx.beginPath();
@@ -169,19 +154,18 @@ export class ArrangeRenderer {
 
     for (const lane of scene.lanes) {
       if (lane.top - view.scrollTop > height || lane.top + lane.height - view.scrollTop < 0) continue;
-      this.drawLane(lane, view, toX, stylized, width, windowStart, windowEnd);
+      this.drawLane(lane, view, toX, width, windowStart, windowEnd);
     }
     ctx.restore();
 
-    this.drawLaneLabels(scene, view, height, stylized);
-    this.drawPlayhead(centreX, height, stylized);
+    this.drawLaneLabels(scene, view, height);
+    this.drawPlayhead(centreX, height);
   }
 
   private drawLane(
     lane: LaneLayout,
     view: ViewState,
     toX: (s: number) => number,
-    stylized: boolean,
     width: number,
     windowStart: number,
     windowEnd: number,
@@ -189,14 +173,13 @@ export class ArrangeRenderer {
     const { ctx } = this;
     const laneTop = lane.top;
 
-    if (!stylized) {
-      ctx.fillStyle = '#12151d';
-      ctx.fillRect(0, laneTop, width, lane.height);
-    }
+    ctx.fillStyle = '#12151d';
+    ctx.fillRect(0, laneTop, width, lane.height);
 
     for (const buffer of this.noteBuckets) buffer.reset();
-    this.flashes.reset();
     this.waveform.reset();
+    this.mutedNotes.reset();
+    this.mutedWaveform.reset();
 
     // Pass 1: region blocks, and notes gathered into per-velocity buckets.
     const start = firstVisibleIndex(lane, windowStart);
@@ -206,23 +189,21 @@ export class ArrangeRenderer {
       if (entry.region.startSeconds > windowEnd) break;
       if (entry.region.endSeconds < windowStart) continue;
 
-      this.drawRegionBlock(entry.region, lane, laneTop, toX, view, stylized, width);
+      this.drawRegionBlock(entry.region, lane, laneTop, toX, view, width);
       if (entry.notes) {
-        this.collectNotes(entry.notes, laneTop, toX, view, stylized, width, windowStart, windowEnd);
+        this.collectNotes(entry.notes, laneTop, toX, view, width, windowStart, windowEnd, entry.region.muted || lane.muted);
       }
     }
 
-    this.flushLane(lane.color, stylized);
+    this.flushLane(lane.color);
 
     // Pass 2: names last, so notes never cover them.
-    if (!stylized) {
-      for (let i = start; i < lane.regions.length; i += 1) {
-        const entry = lane.regions[i];
-        if (!entry) continue;
-        if (entry.region.startSeconds > windowEnd) break;
-        if (entry.region.endSeconds < windowStart) continue;
-        this.drawRegionName(entry.region, laneTop, toX, view);
-      }
+    for (let i = start; i < lane.regions.length; i += 1) {
+      const entry = lane.regions[i];
+      if (!entry) continue;
+      if (entry.region.startSeconds > windowEnd) break;
+      if (entry.region.endSeconds < windowStart) continue;
+      this.drawRegionName(entry.region, laneTop, toX, view);
     }
   }
 
@@ -233,10 +214,9 @@ export class ArrangeRenderer {
     height: number,
     windowStart: number,
     windowEnd: number,
-    stylized: boolean,
   ): void {
     const { ctx } = this;
-    ctx.fillStyle = stylized ? '#07080d' : '#0e1117';
+    ctx.fillStyle = '#0e1117';
     ctx.fillRect(0, 0, width, RULER_HEIGHT);
     ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
     ctx.textBaseline = 'middle';
@@ -276,13 +256,18 @@ export class ArrangeRenderer {
     laneTop: number,
     toX: (s: number) => number,
     view: ViewState,
-    stylized: boolean,
     width: number,
   ): void {
     const { ctx } = this;
     const x = toX(region.startSeconds);
     const w = Math.max(2, (region.endSeconds - region.startSeconds) * view.pixelsPerSecond);
-    const active = view.playheadSeconds >= region.startSeconds && view.playheadSeconds <= region.endSeconds;
+    // A muted region is never "active": it makes no sound under the playhead.
+    // Region mute or track mute: either way the region is silent, and Logic
+    // greys both.
+    const muted = region.muted || lane.muted;
+    const active = !muted
+      && view.playheadSeconds >= region.startSeconds && view.playheadSeconds <= region.endSeconds;
+    const color = muted ? MUTED_COLOR : lane.color;
 
     // A region is as wide as it is long: at 800 px/s a five-minute region is
     // 240k px. Only the visible slice is ever painted.
@@ -290,30 +275,21 @@ export class ArrangeRenderer {
     const fillW = Math.min(width + EDGE_MARGIN, x + w) - fillX;
     if (fillW <= 0) return;
 
-    if (stylized) {
-      ctx.save();
-      ctx.globalCompositeOperation = 'lighter';
-      ctx.translate(0, laneTop - GLOW_PAD);
-      ctx.fillStyle = this.glow(lane.color, lane.height, active);
-      ctx.fillRect(fillX, 0, fillW, lane.height + GLOW_PAD * 2);
-      ctx.restore();
-    } else {
-      ctx.fillStyle = this.shade(lane.color, active ? 0.42 : 0.3);
-      ctx.fillRect(fillX, laneTop + 2, fillW, lane.height - 4);
-      // Strokes are four clipped line segments, so the true rect is fine here.
-      ctx.strokeStyle = this.shade(lane.color, 0.85);
-      ctx.lineWidth = 1;
-      ctx.strokeRect(Math.round(x) + 0.5, laneTop + 2.5, Math.round(w) - 1, lane.height - 5);
-    }
+    ctx.fillStyle = this.shade(color, active ? 0.42 : muted ? 0.16 : 0.3);
+    ctx.fillRect(fillX, laneTop + 2, fillW, lane.height - 4);
+    // Strokes are four clipped line segments, so the true rect is fine here.
+    ctx.strokeStyle = this.shade(color, muted ? 0.5 : 0.85);
+    ctx.lineWidth = 1;
+    ctx.strokeRect(Math.round(x) + 0.5, laneTop + 2.5, Math.round(w) - 1, lane.height - 5);
 
     if (region.kind === 'audio') {
       const pyramid = region.audioFileId ? view.peaks(region.audioFileId) : null;
       if (pyramid) {
-        this.collectWaveform(pyramid, region, laneTop, lane.height, toX, view, fillX, fillW);
+        this.collectWaveform(pyramid, region, laneTop, lane.height, toX, view, fillX, fillW, muted);
       } else {
         // Peaks not read yet, or no file to read: the centre line keeps the
         // region legible rather than leaving it empty.
-        ctx.fillStyle = this.shade(lane.color, 0.5);
+        ctx.fillStyle = this.shade(color, 0.5);
         ctx.fillRect(fillX, laneTop + lane.height / 2 - 1, fillW, 2);
       }
     }
@@ -332,6 +308,7 @@ export class ArrangeRenderer {
     view: ViewState,
     fillX: number,
     fillW: number,
+    muted: boolean,
   ): void {
     const level = levelForPixelsPerSecond(pyramid, view.pixelsPerSecond);
     const data = pyramid.levels[level];
@@ -349,6 +326,8 @@ export class ArrangeRenderer {
     const endX = startX + (region.endSeconds - region.startSeconds) * view.pixelsPerSecond;
     const left = Math.floor(Math.max(fillX, startX));
     const right = Math.min(fillX + fillW, endX);
+    const faded = hasFade(region);
+    const target = muted ? this.mutedWaveform : this.waveform;
 
     for (let x = left; x < right; x += 1) {
       // Timeline seconds map to SOURCE seconds via the trim-in and the flex
@@ -373,9 +352,13 @@ export class ArrangeRenderer {
         if (bucketHigh > high) high = bucketHigh;
       }
 
-      const top = centre - (high / 127) * amplitude;
-      const height = Math.max(1, centre - (low / 127) * amplitude - top);
-      this.waveform.push(x, top, 1, height);
+      // Fades taper the waveform the way they taper the sound.
+      const scale = faded
+        ? amplitude * fadeGain(region, region.startSeconds + (x + 0.5 - startX) * secondsPerPixel)
+        : amplitude;
+      const top = centre - (high / 127) * scale;
+      const height = Math.max(1, centre - (low / 127) * scale - top);
+      target.push(x, top, 1, height);
     }
   }
 
@@ -405,10 +388,10 @@ export class ArrangeRenderer {
     laneTop: number,
     toX: (s: number) => number,
     view: ViewState,
-    stylized: boolean,
     width: number,
     windowStart: number,
     windowEnd: number,
+    muted: boolean,
   ): void {
     const height = batch.noteHeight;
     const from = firstVisibleNote(batch, windowStart);
@@ -426,25 +409,24 @@ export class ArrangeRenderer {
       if (drawW <= 0) continue;
       const y = laneTop + batch.data[offset + 2]!;
 
-      if (stylized
-        && view.playheadSeconds >= startSeconds
-        && view.playheadSeconds <= startSeconds + durSeconds) {
-        this.flashes.push(drawX, y, drawW, height);
+      if (muted) {
+        this.mutedNotes.push(drawX, y, drawW, height);
         continue;
       }
       this.noteBuckets[batch.buckets[i]!]!.push(drawX, y, drawW, height);
     }
   }
 
-  private flushLane(laneColor: string, stylized: boolean): void {
+  private flushLane(laneColor: string): void {
     const { ctx } = this;
-    ctx.save();
-    ctx.shadowBlur = 0;
-    ctx.globalCompositeOperation = stylized ? 'lighter' : 'source-over';
-
     if (this.waveform.size > 0) {
-      ctx.fillStyle = this.shade(laneColor, stylized ? 0.6 : 0.8);
+      ctx.fillStyle = this.shade(laneColor, 0.8);
       this.waveform.fillInto(ctx);
+    }
+    if (this.mutedWaveform.size > 0 || this.mutedNotes.size > 0) {
+      ctx.fillStyle = this.shade(MUTED_COLOR, 0.45);
+      this.mutedWaveform.fillInto(ctx);
+      this.mutedNotes.fillInto(ctx);
     }
 
     for (let bucket = 0; bucket < VELOCITY_BUCKETS; bucket += 1) {
@@ -453,22 +435,9 @@ export class ArrangeRenderer {
       ctx.fillStyle = this.shade(laneColor, 0.45 + (bucket / (VELOCITY_BUCKETS - 1)) * 0.55);
       buffer.fillInto(ctx);
     }
-
-    if (this.flashes.size > 0) {
-      // A dense chord under the playhead would otherwise mean dozens of blurs
-      // in one frame; past the cap the flash stays white but stops glowing.
-      if (this.flashes.size <= MAX_BLURRED_FLASHES) {
-        ctx.shadowColor = '#ffffff';
-        ctx.shadowBlur = NOTE_BLUR;
-      }
-      ctx.fillStyle = '#ffffff';
-      this.flashes.fillInto(ctx);
-    }
-    ctx.restore();
   }
 
-  private drawLaneLabels(scene: Scene, view: ViewState, height: number, stylized: boolean): void {
-    if (stylized) return;
+  private drawLaneLabels(scene: Scene, view: ViewState, height: number): void {
     const { ctx } = this;
     ctx.save();
     ctx.beginPath();
@@ -481,9 +450,9 @@ export class ArrangeRenderer {
     ctx.textBaseline = 'middle';
     for (const lane of scene.lanes) {
       if (lane.top - view.scrollTop > height || lane.top + lane.height - view.scrollTop < 0) continue;
-      ctx.fillStyle = lane.color;
+      ctx.fillStyle = lane.muted ? MUTED_COLOR : lane.color;
       ctx.fillRect(0, lane.top + 2, 3, lane.height - 4);
-      ctx.fillStyle = 'rgba(255,255,255,0.72)';
+      ctx.fillStyle = lane.muted ? 'rgba(255,255,255,0.35)' : 'rgba(255,255,255,0.72)';
       ctx.fillText(lane.name.slice(0, 26), 10, lane.top + lane.height / 2);
     }
     ctx.restore();
@@ -494,22 +463,9 @@ export class ArrangeRenderer {
     ctx.stroke();
   }
 
-  private drawPlayhead(centreX: number, height: number, stylized: boolean): void {
+  private drawPlayhead(centreX: number, height: number): void {
     const { ctx } = this;
-    if (stylized) {
-      const key = `${centreX}|${height}`;
-      if (!this.playheadGradient || this.playheadGradientKey !== key) {
-        const gradient = ctx.createLinearGradient(centreX - 40, 0, centreX + 40, 0);
-        gradient.addColorStop(0, 'rgba(255,255,255,0)');
-        gradient.addColorStop(0.5, 'rgba(255,255,255,0.22)');
-        gradient.addColorStop(1, 'rgba(255,255,255,0)');
-        this.playheadGradient = gradient;
-        this.playheadGradientKey = key;
-      }
-      ctx.fillStyle = this.playheadGradient;
-      ctx.fillRect(centreX - 40, 0, 80, height);
-    }
-    ctx.strokeStyle = stylized ? 'rgba(255,255,255,0.9)' : '#ff5a5f';
+    ctx.strokeStyle = '#ff5a5f';
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.moveTo(Math.round(centreX) + 0.5, 0);

@@ -28,27 +28,61 @@ body {
   height: 100%;
 }
 
-.titlebar {
-  height: 38px;
-  flex: none;
-  -webkit-app-region: drag;
+/*
+ * The toolbar floats over the top of the canvas with no background of its own,
+ * and doubles as the window's drag region now that there is no title bar. Its
+ * left padding clears the macOS traffic lights (see trafficLightPosition in
+ * main.ts). Controls opt out of dragging, or they could not be clicked.
+ */
+.toolbar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 2;
+  height: 44px;
   display: flex;
   align-items: center;
-  justify-content: center;
-  font-size: 12px;
-  color: var(--muted);
-  border-bottom: 1px solid var(--border);
+  gap: 6px;
+  padding: 0 10px 0 82px;
+  background: transparent;
+  flex-wrap: nowrap;
+  white-space: nowrap;
+  overflow: hidden;
+  -webkit-app-region: drag;
+}
+.toolbar button,
+.toolbar input,
+.toolbar select,
+.toolbar label,
+.toolbar .readout,
+.dragstrip button {
+  -webkit-app-region: no-drag;
+}
+/* Over the canvas, controls carry their own frosted backing for legibility. */
+.toolbar button,
+.toolbar select,
+.toolbar label.field input,
+.toolbar .segmented {
+  backdrop-filter: blur(8px);
+}
+.toolbar .readout {
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
 }
 
-.toolbar {
-  flex: none;
+/* With the toolbar hidden, a thin strip still drags the window. */
+.dragstrip {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 2;
+  height: 28px;
   display: flex;
+  justify-content: flex-end;
   align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border);
-  background: var(--panel);
-  flex-wrap: wrap;
+  padding: 0 10px;
+  -webkit-app-region: drag;
 }
 
 button {
@@ -65,6 +99,47 @@ button:hover:not(:disabled) { background: rgba(255, 255, 255, 0.12); }
 button:disabled { opacity: 0.4; cursor: default; }
 button.primary { background: var(--accent); border-color: transparent; color: #fff; }
 button.active { background: rgba(255, 255, 255, 0.18); }
+
+button.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 28px;
+  padding: 0;
+}
+button.ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+}
+.dragstrip button.ghost { opacity: 0.45; }
+.dragstrip button.ghost:hover { opacity: 1; }
+
+/* Two views, one pill: the buttons share a rounded frame with a hairline between. */
+.segmented {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  padding: 2px;
+  -webkit-app-region: no-drag;
+}
+.segmented button.icon {
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  height: 24px;
+  width: 30px;
+}
+.segmented button.icon.active { background: rgba(255, 255, 255, 0.18); }
+.segmented .divider {
+  width: 1px;
+  height: 14px;
+  margin: 0 2px;
+  background: var(--border);
+}
 
 .spacer { flex: 1; }
 
@@ -87,13 +162,40 @@ label.field {
   font-size: 12px;
 }
 label.field input {
-  width: 74px;
+  width: 56px;
   background: rgba(0, 0, 0, 0.35);
   border: 1px solid var(--border);
   border-radius: 5px;
   color: var(--text);
   padding: 4px 6px;
   font: 12px ui-monospace, Menlo, monospace;
+}
+/* Styled like the toolbar buttons, with a drawn chevron in place of the native one. */
+select.spectrum {
+  appearance: none;
+  background: rgba(255, 255, 255, 0.07)
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5'%3E%3Cpath d='M0 0l4 5 4-5z' fill='%23999'/%3E%3C/svg%3E")
+    no-repeat right 8px center;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 5px 24px 5px 10px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+select.spectrum:hover { background-color: rgba(255, 255, 255, 0.12); }
+select.spectrum option { background: #1a1d24; color: var(--text); }
+
+/* One line at any width: the least essential readouts give way first. */
+@media (max-width: 1180px) {
+  .toolbar .readout.key { display: none; }
+}
+@media (max-width: 1060px) {
+  .toolbar label.field.speed { display: none; }
+}
+@media (max-width: 960px) {
+  .toolbar label.field { font-size: 0; gap: 0; }
 }
 
 .stage {
@@ -118,6 +220,8 @@ label.field input {
 }
 .empty h1 { font-size: 17px; font-weight: 600; color: var(--text); margin: 0; }
 .empty p { margin: 0; max-width: 420px; }
+
+.project-name { color: var(--text); }
 
 .statusbar {
   flex: none;

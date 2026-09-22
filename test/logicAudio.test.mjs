@@ -47,6 +47,12 @@ function arrangeList(units, { markerFor = () => 0x24 } = {}) {
     chunk.writeUInt32LE(unit.regionRef, at + 44);
     chunk.writeUInt8(unit.flex ? 0x97 : 0x17, at + 48);
     chunk.writeInt8(unit.gainDb ?? 0, at + 52);
+    // A selected region reads 0x80 here; mute is bit 0 on top of it.
+    chunk.writeUInt8((unit.selected ? 0x80 : 0) | (unit.muted ? 0x01 : 0), at + 15);
+    chunk.writeUInt16LE(unit.fadeOutMs ?? 0, at + 72);
+    chunk.writeInt8(unit.fadeOutCurve ?? 0, at + 75);
+    chunk.writeUInt16LE(unit.fadeInMs ?? 0, at + 76);
+    chunk.writeInt8(unit.fadeInCurve ?? 0, at + 79);
   });
   return chunk;
 }
@@ -159,6 +165,29 @@ test('clip gain reads as a signed decibel byte', () => {
   assert.deepEqual(parseArrangeUnits(buffer).map((u) => u.gainDb), [5, -3, 0]);
 });
 
+test('region mute is bit 0 of +15, independent of the selection bit', () => {
+  // re_probe12: the muted region reads 0x81; re_probe13's merely selected one 0x80.
+  const buffer = arrangeList([
+    { bar: 0, regionRef: 8 },
+    { bar: 4, regionRef: 8, muted: true, selected: true },
+    { bar: 8, regionRef: 8, selected: true },
+  ]);
+  assert.deepEqual(parseArrangeUnits(buffer).map((u) => u.muted), [false, true, false]);
+});
+
+test('fades read as milliseconds with signed curves', () => {
+  // re_probe13/14: a 1-bar fade-in and a 3-bar fade-out at 120 BPM, eased.
+  const buffer = arrangeList([
+    { bar: 0, regionRef: 8, fadeInMs: 1999, fadeInCurve: 98 },
+    { bar: 16, regionRef: 8, fadeOutMs: 5995, fadeOutCurve: 99 },
+    { bar: 24, regionRef: 8, fadeInMs: 2370, fadeInCurve: -43, fadeOutMs: 4590 },
+  ]);
+  assert.deepEqual(
+    parseArrangeUnits(buffer).map((u) => [u.fadeInMs, u.fadeInCurve, u.fadeOutMs, u.fadeOutCurve]),
+    [[1999, 98, 0, 0], [0, 0, 5995, 99], [2370, -43, 4590, 0]],
+  );
+});
+
 test('a unit with an implausible track number is rejected', () => {
   const buffer = arrangeList([{ bar: 0, trackNumber: 200, regionRef: 8 }]);
   assert.deepEqual(parseArrangeUnits(buffer, 16), []);
@@ -192,6 +221,11 @@ test('placement joins units to definitions on regionRef == oid', () => {
     trackNumber: 1,
     gainDb: 0,
     flex: false,
+    muted: false,
+    fadeInMs: 0,
+    fadeOutMs: 0,
+    fadeInCurve: 0,
+    fadeOutCurve: 0,
   });
   assert.equal(placed[1].name, 'bass');
 });

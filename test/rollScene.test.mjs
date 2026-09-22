@@ -79,7 +79,7 @@ function audioRegion(id, trackId, startSeconds, endSeconds, extra = {}) {
 
 test('transcribed notes map through trim-in and flex rate, and clip to the region', () => {
   // Source notes at 1 s (pitch 60) and 3 s (pitch 62), each 1 s long.
-  const notes = new Float32Array([1, 1, 60, 100, 3, 1, 62, 100]);
+  const notes = new Float32Array([1, 1, 60, 100, 0, 3, 1, 62, 100, 0]);
   const scene = buildRollScene(project([track('a', 0)], [
     // Region starts at 10 s, trims 0.5 s in, plays source at double speed, lasts 1.5 s.
     audioRegion('r', 'a', 10, 11.5, { fileStartSeconds: 0.5, sourceRate: 2 }),
@@ -98,7 +98,7 @@ test('transcribed notes map through trim-in and flex rate, and clip to the regio
 });
 
 test('with MIDI present, converted notes outside its range are dropped; muted audio is ignored', () => {
-  const notes = new Float32Array([0, 1, 20, 100, 0, 1, 61, 100]);
+  const notes = new Float32Array([0, 1, 20, 100, 0, 0, 1, 61, 100, 0]);
   const scene = buildRollScene(project([track('a', 0), track('b', 1), track('c', 2, true)], [
     midi('m', 'a', 0, [[0, PPQ, 60, 100]]),
     audioRegion('r', 'b', 0, 2),
@@ -108,4 +108,25 @@ test('with MIDI present, converted notes outside its range are dropped; muted au
   assert.deepEqual(converted.map((t) => t.trackId), ['b']);
   assert.deepEqual(Array.from(converted[0].pitch), [61]);
   assert.ok(scene.pitchLow > 20);
+});
+
+test('unpitched hits are clamped into the roll rather than dropped', () => {
+  // A kick at pitch 35 and a hat at 120, against MIDI that keeps the roll near middle C.
+  const notes = new Float32Array([0, 0.1, 35, 100, 1, 0.5, 0.1, 120, 100, 1]);
+  const scene = buildRollScene(project([track('a', 0), track('b', 1)], [
+    midi('m', 'a', 0, [[0, PPQ, 60, 100]]),
+    audioRegion('r', 'b', 0, 2),
+  ]), () => notes);
+  const converted = scene.tracks.find((t) => t.converted);
+  assert.deepEqual(Array.from(converted.pitch), [scene.pitchLow, scene.pitchHigh]);
+});
+
+test('muted regions are left out of the roll, MIDI and audio alike', () => {
+  const scene = buildRollScene(project([track('a', 0), track('b', 1)], [
+    midi('m1', 'a', 0, [[0, PPQ, 60, 100]]),
+    { ...midi('m2', 'a', 4, [[0, PPQ, 62, 100]]), muted: true },
+    { ...audioRegion('r', 'b', 0, 2), muted: true },
+  ]), () => new Float32Array([0, 1, 61, 100, 0]));
+  assert.deepEqual(scene.tracks.map((t) => [t.trackId, t.count]), [['a', 1]]);
+  assert.equal(scene.audio.length, 0);
 });

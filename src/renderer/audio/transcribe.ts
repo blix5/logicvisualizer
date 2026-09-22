@@ -7,11 +7,29 @@
 // smoothed, and runs of the same pitch become notes. The piano roll draws each
 // note as the region's own waveform shifted to that pitch, Flex Pitch style.
 //
+// Unpitched sounds (drums, mostly) have no harmonic series for that to find, so
+// they get a second pass: onsets are detected in three frequency bands of the
+// full-rate signal, and each hit is placed at its band's FIXED pitch — kicks
+// low, snares and claps in the middle, hats and cymbals high — as a note
+// flagged unpitched. A band's hits are dropped where a pitched note in the
+// same band is already sounding, so a bassline does not double as kicks.
+//
 // Pure and dependency-free, so the worker, the main-thread fallback and the
 // unit tests share it.
 
-/** 4 floats per note: [startSeconds, durationSeconds, pitch, velocity 1..127], source-file time. */
-export const TRANSCRIBED_FIELDS = 4;
+/**
+ * 5 floats per note, source-file time:
+ * [startSeconds, durationSeconds, pitch, velocity 1..127, unpitched 0|1].
+ */
+export const TRANSCRIBED_FIELDS = 5;
+
+/**
+ * Where unpitched hits sit, as MIDI pitches at each band's typical frequency:
+ * ~62 Hz for kicks, ~220 Hz for snare bodies and claps, ~8.4 kHz for hats.
+ * The roll clamps them into its range, so a narrow roll still shows low hits
+ * at its bottom and high ones at its top.
+ */
+export const UNPITCHED_PITCH = { low: 35, mid: 57, high: 120 } as const;
 
 /** Working sample rate after decimation. Pitch 100 (~2.6 kHz) is well inside it. */
 const TARGET_RATE = 11025;
@@ -27,6 +45,21 @@ const ABSOLUTE_FLOOR_DB = -70;
 const HARMONICS = [0, 12, 19, 24, 28];
 const HARMONIC_WEIGHTS = [1, 0.8, 0.64, 0.5, 0.4];
 const MIN_FRAMES = 2;
+
+/** Onset detection: energy blocks of 10 ms at the file's own rate. */
+const BLOCK_SECONDS = 0.01;
+/** A rise this far above the quietest of the previous few blocks is an onset. */
+const ONSET_RISE_DB = 9;
+const ONSET_LOOKBACK = 3;
+/** Hits quieter than this below the band's loudest are ignored. */
+const ONSET_RANGE_DB = 35;
+const ONSET_FLOOR_DB = -60;
+/** One band cannot retrigger faster than this (a 1/32 at 180 BPM is ~42 ms). */
+const ONSET_REFRACTORY_BLOCKS = 5;
+/** A hit lasts until it decays this far below its peak, within these bounds. */
+const HIT_DECAY_DB = 15;
+const HIT_MIN_BLOCKS = 5;
+const HIT_MAX_BLOCKS = 30;
 
 /** In-place iterative radix-2 FFT over separate real and imaginary arrays. */
 function fft(re: Float64Array, im: Float64Array, cos: Float64Array, sin: Float64Array): void {
@@ -182,11 +215,169 @@ export function transcribe(channels: Float32Array[], sampleRate: number): Float3
       for (let k = runStart; k < f; k += 1) sum += loudness[k]!;
       const mean = sum / frameCount;
       const velocity = Math.max(1, Math.min(127, Math.round(127 * (1 + (mean - fileMax) / FILE_RANGE_DB))));
-      out.push(frameStart(runStart), frameCount * secondsPerFrame, PITCH_LOW + p, velocity);
+      out.push(frameStart(runStart), frameCount * secondsPerFrame, PITCH_LOW + p, velocity, 0);
     }
     runStart = f;
   }
 
-  // Runs are emitted in time order, one at a time: already sorted, never overlapping.
-  return new Float32Array(out);
+  // Pitched runs come out in time order, one at a time: sorted and disjoint.
+  const hits = detectHits(channels, sampleRate);
+  const pitched = dropDrumSmear(out, hits);
+
+  // Merge the two start-sorted lists.
+  const result = new Float32Array(pitched.length + hits.length);
+  let a = 0;
+  let b = 0;
+  let at = 0;
+  while (a < pitched.length || b < hits.length) {
+    const takePitched = b >= hits.length || (a < pitched.length && pitched[a]! <= hits[b]!);
+    const from = takePitched ? pitched : hits;
+    const index = takePitched ? a : b;
+    for (let k = 0; k < TRANSCRIBED_FIELDS; k += 1) result[at + k] = from[index + k]!;
+    at += TRANSCRIBED_FIELDS;
+    if (takePitched) a += TRANSCRIBED_FIELDS; else b += TRANSCRIBED_FIELDS;
+  }
+  return result;
+}
+
+/** RBJ-cookbook biquad, direct form I, run one sample at a time. */
+class Biquad {
+  private b0 = 0; private b1 = 0; private b2 = 0; private a1 = 0; private a2 = 0;
+  private x1 = 0; private x2 = 0; private y1 = 0; private y2 = 0;
+
+  constructor(kind: 'lowpass' | 'highpass', hz: number, sampleRate: number) {
+    const w = (2 * Math.PI * Math.min(hz, sampleRate * 0.45)) / sampleRate;
+    const alpha = Math.sin(w) / (2 * Math.SQRT1_2);
+    const cos = Math.cos(w);
+    const a0 = 1 + alpha;
+    const edge = kind === 'lowpass' ? (1 - cos) / 2 : (1 + cos) / 2;
+    this.b0 = edge / a0;
+    this.b1 = (kind === 'lowpass' ? 1 - cos : -(1 + cos)) / a0;
+    this.b2 = edge / a0;
+    this.a1 = (-2 * cos) / a0;
+    this.a2 = (1 - alpha) / a0;
+  }
+
+  step(x: number): number {
+    const y = this.b0 * x + this.b1 * this.x1 + this.b2 * this.x2 - this.a1 * this.y1 - this.a2 * this.y2;
+    this.x2 = this.x1; this.x1 = x;
+    this.y2 = this.y1; this.y1 = y;
+    return y;
+  }
+}
+
+type BandName = keyof typeof UNPITCHED_PITCH;
+const BAND_NAMES: BandName[] = ['low', 'mid', 'high'];
+/** A band's hit is leakage if another band is this much louder at the same instant. */
+const DOMINANCE_DB = 15;
+/** Pitched notes below this, starting around a low hit, are the drum's smear. */
+const SMEAR_MAX_PITCH = 51;
+const SMEAR_MAX_SECONDS = 0.8;
+/** The pitch pass's window is ~370 ms, so its notes can start up to half that early. */
+const SMEAR_LEAD_SECONDS = 0.25;
+
+type Hit = { band: number; block: number; end: number; peak: number };
+
+/**
+ * Percussive onsets per band, as unpitched notes. Band energies come from
+ * biquads over the full-rate mono signal — full rate matters, since hats live
+ * above the ~5.5 kHz the pitch pass keeps. A hit must decay quickly, which is
+ * what separates a drum from the start of a sustained note in the same band.
+ */
+function detectHits(channels: Float32Array[], sampleRate: number): number[] {
+  const frames = channels[0]!.length;
+  const block = Math.max(1, Math.round(sampleRate * BLOCK_SECONDS));
+  const blocks = Math.floor(frames / block);
+  if (blocks <= ONSET_LOOKBACK) return [];
+
+  const low = [new Biquad('lowpass', 150, sampleRate), new Biquad('lowpass', 150, sampleRate)];
+  const mid = [new Biquad('highpass', 250, sampleRate), new Biquad('lowpass', 2500, sampleRate)];
+  const high = [new Biquad('highpass', 6000, sampleRate), new Biquad('highpass', 6000, sampleRate)];
+
+  const energy = BAND_NAMES.map(() => new Float32Array(blocks));
+  const scale = 1 / channels.length;
+  for (let k = 0; k < blocks; k += 1) {
+    let sumLow = 0; let sumMid = 0; let sumHigh = 0;
+    const base = k * block;
+    for (let i = 0; i < block; i += 1) {
+      let x = 0;
+      for (const channel of channels) x += channel[base + i]!;
+      x *= scale;
+      const l = low[1]!.step(low[0]!.step(x));
+      const m = mid[1]!.step(mid[0]!.step(x));
+      const h = high[1]!.step(high[0]!.step(x));
+      sumLow += l * l; sumMid += m * m; sumHigh += h * h;
+    }
+    // dB relative to a full-scale sine's mean square (0.5).
+    energy[0]![k] = 10 * Math.log10(sumLow / block / 0.5 + 1e-20);
+    energy[1]![k] = 10 * Math.log10(sumMid / block / 0.5 + 1e-20);
+    energy[2]![k] = 10 * Math.log10(sumHigh / block / 0.5 + 1e-20);
+  }
+
+  const bandMax = energy.map((e) => e.reduce((m, v) => (v > m ? v : m), -Infinity));
+  const candidates: Hit[] = [];
+  for (let b = 0; b < BAND_NAMES.length; b += 1) {
+    const e = energy[b]!;
+    const floor = Math.max(ONSET_FLOOR_DB, bandMax[b]! - ONSET_RANGE_DB);
+    let last = -Infinity;
+    for (let k = ONSET_LOOKBACK; k < blocks; k += 1) {
+      if (e[k]! < floor || k - last < ONSET_REFRACTORY_BLOCKS) continue;
+      let before = Infinity;
+      for (let j = 1; j <= ONSET_LOOKBACK; j += 1) before = Math.min(before, e[k - j]!);
+      if (e[k]! - before < ONSET_RISE_DB) continue;
+      last = k;
+
+      // Ride up to the peak, then out to where it has decayed. No decay within
+      // the window means a sustained sound starting, not a hit.
+      let peakAt = k;
+      while (peakAt + 1 < blocks && peakAt - k < 3 && e[peakAt + 1]! > e[peakAt]!) peakAt += 1;
+      const peak = e[peakAt]!;
+      let end = peakAt + 1;
+      while (end < blocks && end - k < HIT_MAX_BLOCKS && e[end]! > peak - HIT_DECAY_DB) end += 1;
+      if (end < blocks && e[end]! > peak - HIT_DECAY_DB) continue;
+      if (end >= blocks) continue;
+      candidates.push({ band: b, block: k, end: Math.max(end, k + HIT_MIN_BLOCKS), peak });
+    }
+  }
+
+  const hits: number[] = [];
+  candidates.sort((x, y) => x.block - y.block);
+  for (const hit of candidates) {
+    // Leakage: some other band is far louder right here.
+    let loudest = -Infinity;
+    for (let b = 0; b < BAND_NAMES.length; b += 1) {
+      if (b === hit.band) continue;
+      for (let k = Math.max(0, hit.block - 1); k <= Math.min(blocks - 1, hit.block + 3); k += 1) {
+        if (energy[b]![k]! > loudest) loudest = energy[b]![k]!;
+      }
+    }
+    if (loudest - hit.peak > DOMINANCE_DB) continue;
+    const name = BAND_NAMES[hit.band]!;
+    const velocity = Math.max(1, Math.min(127, Math.round(127 * (1 + (hit.peak - bandMax[hit.band]!) / ONSET_RANGE_DB))));
+    hits.push((hit.block * block) / sampleRate, ((hit.end - hit.block) * block) / sampleRate, UNPITCHED_PITCH[name], velocity, 1);
+  }
+  return hits;
+}
+
+/**
+ * Drops short, low pitched notes that start around a low percussive hit: a
+ * kick's tail has enough low tone to read as a brief bass note, smeared early
+ * by the pitch pass's long window.
+ */
+function dropDrumSmear(pitched: number[], hits: number[]): number[] {
+  const kicks: number[] = [];
+  for (let i = 0; i < hits.length; i += TRANSCRIBED_FIELDS) {
+    if (hits[i + 2] === UNPITCHED_PITCH.low) kicks.push(hits[i]!);
+  }
+  if (kicks.length === 0) return pitched;
+  const kept: number[] = [];
+  for (let i = 0; i < pitched.length; i += TRANSCRIBED_FIELDS) {
+    const start = pitched[i]!;
+    const smear = pitched[i + 2]! <= SMEAR_MAX_PITCH
+      && pitched[i + 1]! <= SMEAR_MAX_SECONDS
+      && kicks.some((k) => start >= k - SMEAR_LEAD_SECONDS && start <= k + 0.05);
+    if (smear) continue;
+    for (let k = 0; k < TRANSCRIBED_FIELDS; k += 1) kept.push(pitched[i + k]!);
+  }
+  return kept;
 }

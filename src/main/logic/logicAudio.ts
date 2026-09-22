@@ -85,6 +85,28 @@ const UNIT_GAIN_DB_OFFSET = 52;
  */
 const UNIT_FLAGS_OFFSET = 48;
 const UNIT_FLEX_BIT = 0x80;
+/**
+ * Bit 0 set when the region is muted. Established with re_probe12, which mutes
+ * only the second of re_probe5's three regions: its +15 goes 0x00 -> 0x81,
+ * while a region that is merely selected reads 0x80 (re_probe13). Across
+ * ~/Music/Logic the bit is set on 2 of 13,797 placements, which is about how
+ * rarely people mute regions rather than tracks.
+ */
+const UNIT_MUTE_OFFSET = 15;
+const UNIT_MUTE_BIT = 0x01;
+/**
+ * Fades, in milliseconds (u16), each followed a byte later by its curve (i8,
+ * -99..99, 0 = linear). Established with re_probe13 (a 1-bar fade-in on region
+ * 1 and a 3-bar fade-out on region 3, at 120 BPM: +76 = 1999 and +72 = 5995,
+ * i.e. 2 s and 6 s as dragged) and re_probe14 (the same fades set to ease in /
+ * ease out: +79 = 98, +75 = 99). Across the corpus 2,223 placements have a
+ * fade-in and 3,237 a fade-out, and all but 12 fit inside their region; the
+ * commonest value is Logic's 17 ms anti-click fade-out.
+ */
+const UNIT_FADE_OUT_MS_OFFSET = 72;
+const UNIT_FADE_OUT_CURVE_OFFSET = 75;
+const UNIT_FADE_IN_MS_OFFSET = 76;
+const UNIT_FADE_IN_CURVE_OFFSET = 79;
 
 export const LOGIC_PPQ = 960;
 /** Bar 1 in the arrangement sequence. Deliberately not the MIDI 38400 origin. */
@@ -132,6 +154,12 @@ export type LogicArrangeUnit = {
   gainDb: number;
   /** Flex on: the region is time-stretched to follow project tempo. */
   flex: boolean;
+  muted: boolean;
+  fadeInMs: number;
+  fadeOutMs: number;
+  /** -99..99, 0 linear; see UNIT_FADE_IN_CURVE_OFFSET. */
+  fadeInCurve: number;
+  fadeOutCurve: number;
 };
 
 function findAllTags(buffer: Buffer, tag: string): number[] {
@@ -234,6 +262,11 @@ export function parseArrangeUnits(buffer: Buffer, maxTrackNumber = MAX_TRACK_NUM
       ordinal: buffer.readUInt32LE(at + UNIT_ORDINAL_OFFSET),
       gainDb: buffer.readInt8(at + UNIT_GAIN_DB_OFFSET),
       flex: (buffer.readUInt8(at + UNIT_FLAGS_OFFSET) & UNIT_FLEX_BIT) !== 0,
+      muted: (buffer.readUInt8(at + UNIT_MUTE_OFFSET) & UNIT_MUTE_BIT) !== 0,
+      fadeInMs: buffer.readUInt16LE(at + UNIT_FADE_IN_MS_OFFSET),
+      fadeOutMs: buffer.readUInt16LE(at + UNIT_FADE_OUT_MS_OFFSET),
+      fadeInCurve: buffer.readInt8(at + UNIT_FADE_IN_CURVE_OFFSET),
+      fadeOutCurve: buffer.readInt8(at + UNIT_FADE_OUT_CURVE_OFFSET),
     });
   }
   return units;
@@ -252,6 +285,11 @@ export type PlacedAudioRegion = {
   gainDb: number;
   /** Flex on: time-stretched to project tempo, so lengthSamples is NOT its timeline length. */
   flex: boolean;
+  muted: boolean;
+  fadeInMs: number;
+  fadeOutMs: number;
+  fadeInCurve: number;
+  fadeOutCurve: number;
 };
 
 /**
@@ -289,6 +327,11 @@ export function placedAudioRegions(buffer: Buffer, maxTrackNumber?: number): Pla
       trackNumber: unit.trackNumber,
       gainDb: unit.gainDb,
       flex: unit.flex,
+      muted: unit.muted,
+      fadeInMs: unit.fadeInMs,
+      fadeOutMs: unit.fadeOutMs,
+      fadeInCurve: unit.fadeInCurve,
+      fadeOutCurve: unit.fadeOutCurve,
     });
   }
   return placed;

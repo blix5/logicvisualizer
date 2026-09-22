@@ -4,8 +4,7 @@
 // the bounce runs along the bottom, and audio regions glow faintly behind the
 // notes. The playhead is fixed at horizontal centre, as in the other modes.
 //
-// This is the most stylized mode, so it leans hardest on the rules that keep
-// Stylized affordable, plus a few of its own:
+// It is the heavily styled view, so a few rules keep it cheap:
 //   1. No shadowBlur anywhere. Note glow is the same batch drawn a second time,
 //      inflated, at low alpha; the flash under the playhead is a pre-rendered
 //      radial sprite blitted with drawImage.
@@ -16,7 +15,9 @@
 //      rather than a fillRect per pixel column, read from the peak pyramid at
 //      the coarsest level that still covers every column.
 //   4. Pitch-to-y is a table, rebuilt only when the layout changes.
-import { withAlpha, type StereoSpectrum, type ViewState } from './ArrangeRenderer';
+import { withAlpha, type ViewState } from './ArrangeRenderer';
+import type { AudioRegionModel } from '../../shared/model';
+import { fadeGain, hasFade } from './fade';
 import { levelForPixelsPerSecond, peakCount, type PeakPyramid } from './peaks';
 import { RectBuffer } from './rectBuffer';
 import {
@@ -26,6 +27,7 @@ import {
   type RollTrack,
 } from './rollScene';
 import { VELOCITY_BUCKETS } from './scene';
+import { SpectrumPainter } from './spectrum';
 
 const BACKGROUND = '#04050a';
 /** Bar ticks along the very top edge. */
@@ -56,15 +58,6 @@ const BLACK_KEYS = new Set([1, 3, 6, 8, 10]);
 const WAVE_ROWS = 1.8;
 /** Quiet files are scaled up to fill the blob, but only this far. */
 const MAX_WAVE_GAIN = 4;
-/** Spectrum line: log-frequency span across the roll, and its sampling step. */
-const SPECTRUM_LOW_HZ = 30;
-const SPECTRUM_HIGH_HZ = 16000;
-const SPECTRUM_STEP = 2;
-/** dB range the line spans, bottom to top; matches the analyser's settings. */
-const SPECTRUM_FLOOR_DB = -95;
-const SPECTRUM_CEIL_DB = -15;
-/** Share of the roll's height each channel's spectrum may reach. */
-const SPECTRUM_REACH = 0.42;
 
 export class PianoRollRenderer {
   private readonly canvas: HTMLCanvasElement;
@@ -101,10 +94,7 @@ export class PianoRollRenderer {
   private playheadBand: CanvasGradient | null = null;
   private gradientKey = '';
 
-  // Spectrum column-to-bin table, rebuilt when the width or FFT size changes.
-  private spectrumKey = '';
-  private spectrumFrom = new Int32Array(0);
-  private spectrumTo = new Int32Array(0);
+  private readonly spectrum = new SpectrumPainter();
 
   // Envelope scratch, reused every frame.
   private envHigh = new Float32Array(1024);
@@ -318,7 +308,23 @@ export class PianoRollRenderer {
     this.drawLitKeys(scene);
     const level = this.drawBounce(view, centreX, width, height);
     this.drawPlayhead(centreX, height, level);
-    if (view.spectrum) this.drawSpectrum(view.spectrum, width);
+    if (view.spectrumMode && view.spectrumMode !== 'none') {
+      this.spectrum.draw(ctx, view.spectrumMode, view.spectrum ?? null, {
+        width,
+        centreX,
+        rollTop: this.rollTop,
+        rollBottom: this.rollBottom,
+        keyWidth: KEY_WIDTH,
+        pitchLow: scene.pitchLow,
+        pitchHigh: scene.pitchHigh,
+        pitchY: this.pitchY,
+        rowHeight: this.rowHeight,
+        pixelsPerSecond: view.pixelsPerSecond,
+        playheadSeconds: view.playheadSeconds,
+        live: view.spectrumLive ?? false,
+        scene,
+      });
+    }
   }
 
   private drawBars(
@@ -409,6 +415,26 @@ export class PianoRollRenderer {
     return count;
   }
 
+  /**
+   * Tapers the envelope in the scratch arrays by the region's fades. Column n
+   * sits at `left + n * step`; `startX` is where the region starts on screen.
+   */
+  private applyFades(
+    region: AudioRegionModel,
+    count: number,
+    left: number,
+    step: number,
+    startX: number,
+    spp: number,
+  ): void {
+    if (!hasFade(region)) return;
+    for (let n = 0; n < count; n += 1) {
+      const gain = fadeGain(region, region.startSeconds + (left + n * step - startX) * spp);
+      this.envHigh[n] = this.envHigh[n]! * gain;
+      this.envLow[n] = this.envLow[n]! * gain;
+    }
+  }
+
   /** Fills the envelope in the scratch arrays as one closed path. */
   private fillEnvelope(count: number, left: number, step: number, centre: number, amplitude: number): void {
     if (count === 0) return;
@@ -462,6 +488,7 @@ export class PianoRollRenderer {
         pyramid, left, right, BACKGROUND_STEP, startX, spp,
         region.sourceRate > 0 ? region.sourceRate : 1, region.fileStartSeconds,
       );
+      this.applyFades(region, count, left, BACKGROUND_STEP, startX, spp);
       const active = view.playheadSeconds >= region.startSeconds && view.playheadSeconds <= region.endSeconds;
       this.ctx.fillStyle = this.shade(color, active ? lit : idle);
       this.fillEnvelope(count, left, BACKGROUND_STEP, centre, amplitude);
@@ -595,12 +622,14 @@ export class PianoRollRenderer {
 
       const region = sources[source[i]!]!;
       const pyramid = region.audioFileId ? view.peaks(region.audioFileId) : null;
+      const regionX = toX(region.startSeconds);
       const count = pyramid
         ? this.envelope(
-          pyramid, left, right, 1, toX(region.startSeconds), spp,
+          pyramid, left, right, 1, regionX, spp,
           region.sourceRate > 0 ? region.sourceRate : 1, region.fileStartSeconds,
         )
         : 0;
+      this.applyFades(region, count, left, 1, regionX, spp);
       if (count > 0) {
         const scale = amplitude * this.waveGain(pyramid!);
         const last = Math.min(right, left + count - 1);
@@ -714,101 +743,6 @@ export class PianoRollRenderer {
 
     const at = Math.min(count - 1, Math.round(centreX));
     return Math.min(1, Math.max(Math.abs(this.envHigh[at]!), Math.abs(this.envLow[at]!)));
-  }
-
-  /**
-   * A faint live stereo spectrum over everything, on a log-frequency axis. The
-   * left channel rises from the bottom of the roll and the right hangs from its
-   * top, each one stroked line with a barely-there fill, in cool and warm tints
-   * so the two read apart. Each column takes the loudest bin in its frequency
-   * span, so the high end, where one column covers hundreds of bins, still
-   * shows its peaks rather than an average.
-   */
-  private drawSpectrum(spectrum: StereoSpectrum, width: number): void {
-    const bins = spectrum.left.length;
-    if (bins === 0 || spectrum.right.length !== bins) return;
-    const columns = Math.max(0, Math.floor((width - KEY_WIDTH) / SPECTRUM_STEP) + 1);
-    const key = `${width}|${bins}|${spectrum.sampleRate}`;
-    if (key !== this.spectrumKey) {
-      this.spectrumKey = key;
-      this.spectrumFrom = new Int32Array(columns);
-      this.spectrumTo = new Int32Array(columns);
-      const hzPerBin = spectrum.sampleRate / 2 / bins;
-      const span = Math.log(SPECTRUM_HIGH_HZ / SPECTRUM_LOW_HZ);
-      for (let c = 0; c < columns; c += 1) {
-        const lowHz = SPECTRUM_LOW_HZ * Math.exp((span * c) / columns);
-        const highHz = SPECTRUM_LOW_HZ * Math.exp((span * (c + 1)) / columns);
-        const from = Math.min(bins - 1, Math.floor(lowHz / hzPerBin));
-        this.spectrumFrom[c] = from;
-        this.spectrumTo[c] = Math.min(bins - 1, Math.max(from, Math.ceil(highHz / hzPerBin)));
-      }
-    }
-
-    const drewLeft = this.drawSpectrumChannel(
-      spectrum.left, columns, this.rollBottom, -1, 'rgba(170,205,255,0.26)', 'rgba(140,180,255,0.035)',
-    );
-    const drewRight = this.drawSpectrumChannel(
-      spectrum.right, columns, this.rollTop, 1, 'rgba(255,190,215,0.24)', 'rgba(255,160,200,0.03)',
-    );
-
-    const { ctx } = this;
-    ctx.font = '9px ui-monospace, SFMono-Regular, Menlo, monospace';
-    ctx.textAlign = 'right';
-    if (drewLeft) {
-      ctx.textBaseline = 'bottom';
-      ctx.fillStyle = 'rgba(170,205,255,0.35)';
-      ctx.fillText('L', width - 6, this.rollBottom - 3);
-    }
-    if (drewRight) {
-      ctx.textBaseline = 'top';
-      ctx.fillStyle = 'rgba(255,190,215,0.35)';
-      ctx.fillText('R', width - 6, this.rollTop + 3);
-    }
-    ctx.textAlign = 'start';
-  }
-
-  /**
-   * One channel's line, growing from `baseline` in `direction` (-1 up, +1
-   * down). Returns false, having drawn nothing, when the channel is silent: a
-   * flat line along the edge adds nothing.
-   */
-  private drawSpectrumChannel(
-    db: Float32Array,
-    columns: number,
-    baseline: number,
-    direction: number,
-    stroke: string,
-    fill: string,
-  ): boolean {
-    const { ctx } = this;
-    const reach = (this.rollBottom - this.rollTop) * SPECTRUM_REACH;
-    const scale = (reach / (SPECTRUM_CEIL_DB - SPECTRUM_FLOOR_DB)) * direction;
-    let loudest = SPECTRUM_FLOOR_DB;
-
-    ctx.beginPath();
-    for (let c = 0; c < columns; c += 1) {
-      let peak = -Infinity;
-      for (let bin = this.spectrumFrom[c]!; bin <= this.spectrumTo[c]!; bin += 1) {
-        if (db[bin]! > peak) peak = db[bin]!;
-      }
-      if (peak > loudest) loudest = peak;
-      const clamped = Math.max(SPECTRUM_FLOOR_DB, Math.min(SPECTRUM_CEIL_DB, peak));
-      const y = baseline + (clamped - SPECTRUM_FLOOR_DB) * scale;
-      const x = KEY_WIDTH + c * SPECTRUM_STEP;
-      if (c === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    if (loudest <= SPECTRUM_FLOOR_DB + 1) return false;
-
-    ctx.lineWidth = 1;
-    ctx.strokeStyle = stroke;
-    ctx.stroke();
-    ctx.lineTo(KEY_WIDTH + (columns - 1) * SPECTRUM_STEP, baseline);
-    ctx.lineTo(KEY_WIDTH, baseline);
-    ctx.closePath();
-    ctx.fillStyle = fill;
-    ctx.fill();
-    return true;
   }
 
   /** The band breathes with the bounce's level at the playhead. */

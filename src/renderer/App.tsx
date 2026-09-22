@@ -3,6 +3,18 @@ import { isFailure } from '../shared/ipc';
 import type { ProjectModel } from '../shared/model';
 import { bpmAtBeat, buildBarGrid, buildTempoMap, secondsToBeats } from '../shared/timebase';
 import { PeakStore } from './audio/PeakStore';
+import {
+  ArrangeIcon,
+  AudioToMidiIcon,
+  ChevronDownIcon,
+  ChevronUpIcon,
+  MusicUploadIcon,
+  PauseIcon,
+  PianoRollIcon,
+  PlayIcon,
+  ReloadIcon,
+  ToStartIcon,
+} from './components/icons';
 import { TranscriptionStore } from './audio/TranscriptionStore';
 import { reduceBufferPeaks } from './audio/reducePeaks';
 import { ArrangeRenderer, type RenderMode, type StereoSpectrum } from './render/ArrangeRenderer';
@@ -10,6 +22,7 @@ import { PianoRollRenderer } from './render/PianoRollRenderer';
 import type { PeakPyramid } from './render/peaks';
 import { buildRollScene } from './render/rollScene';
 import { buildScene } from './render/scene';
+import { SPECTRUM_MODES, type SpectrumMode } from './render/spectrum';
 import { AudioClock } from './transport/AudioClock';
 
 const LANE_CONFIG = { laneHeight: 44, laneGap: 4 };
@@ -35,6 +48,15 @@ function formatMeter(project: ProjectModel): string {
   return sig ? `${sig.numerator}/${sig.denominator}` : '4/4';
 }
 
+const HEADER_HIDDEN_KEY = 'lv.headerHidden';
+/** Height of the floating toolbar; keep in step with .toolbar in app.css. */
+const HEADER_HEIGHT = 44;
+
+/** Whether the toolbar was hidden last session. Storage can throw; default to shown. */
+function readHeaderHidden(): boolean {
+  try { return window.localStorage.getItem(HEADER_HIDDEN_KEY) === '1'; } catch { return false; }
+}
+
 function formatTime(seconds: number): string {
   const sign = seconds < 0 ? '-' : '';
   const abs = Math.abs(seconds);
@@ -58,7 +80,8 @@ export function App(): JSX.Element {
   const [peaksVersion, setPeaksVersion] = useState(0);
   /** Piano-roll display options. */
   const [convertAudio, setConvertAudio] = useState(false);
-  const [showSpectrum, setShowSpectrum] = useState(false);
+  const [spectrumMode, setSpectrumMode] = useState<SpectrumMode>('none');
+  const [headerHidden, setHeaderHidden] = useState(readHeaderHidden);
   /** Bumped as transcriptions land, which rebuilds the roll scene. */
   const [transcriptVersion, setTranscriptVersion] = useState(0);
 
@@ -86,8 +109,9 @@ export function App(): JSX.Element {
   const dirtyRef = useRef(0);
   // The render loop reads these refs directly so it never depends on React
   // re-rendering at frame rate.
-  const viewRef = useRef({ pixelsPerSecond, mode, bounceOffset, showSpectrum });
-  viewRef.current = { pixelsPerSecond, mode, bounceOffset, showSpectrum };
+  const topInset = headerHidden ? 0 : HEADER_HEIGHT;
+  const viewRef = useRef({ pixelsPerSecond, mode, bounceOffset, spectrumMode, topInset });
+  viewRef.current = { pixelsPerSecond, mode, bounceOffset, spectrumMode, topInset };
 
   const scene = useMemo(
     () => (project ? buildScene(project, LANE_CONFIG) : null),
@@ -138,6 +162,15 @@ export function App(): JSX.Element {
     return entry && entry.state === 'ready' ? entry.pyramid : null;
   }, []);
 
+  useEffect(() => {
+    try { window.localStorage.setItem(HEADER_HIDDEN_KEY, headerHidden ? '1' : '0'); } catch { /* per-session only */ }
+  }, [headerHidden]);
+
+  // The title bar is gone, so the project name lives in the window title.
+  useEffect(() => {
+    document.title = project ? `${project.projectName} — Logic Visualizer` : 'Logic Visualizer';
+  }, [project]);
+
   useEffect(() => () => {
     peakStoreRef.current?.dispose();
     transcriptStoreRef.current?.dispose();
@@ -150,7 +183,9 @@ export function App(): JSX.Element {
     const audible = new Set(model.tracks.filter((track) => !track.muted).map((track) => track.id));
     const used = new Set<string>();
     for (const region of model.regions) {
-      if (region.kind === 'audio' && region.audioFileId && audible.has(region.trackId)) used.add(region.audioFileId);
+      if (region.kind === 'audio' && region.audioFileId && !region.muted && audible.has(region.trackId)) {
+        used.add(region.audioFileId);
+      }
     }
     store.setFiles(model.audioFiles.filter((file) => used.has(file.id)));
   }, []);
@@ -256,7 +291,7 @@ export function App(): JSX.Element {
       const renderer = rendererRef.current;
       if (!renderer) return;
       const view = viewRef.current;
-      if (!scene) { renderer.clear(view.mode); return; }
+      if (!scene) { renderer.clear(); return; }
       const clock = clockRef.current;
       const media = clock ? clock.now() : 0;
       const projectSeconds = media - view.bounceOffset;
@@ -265,7 +300,7 @@ export function App(): JSX.Element {
       // every frame draws — during playback and for a moment after, while the
       // analyser's smoothing decays to silence.
       let spectrum: StereoSpectrum | null = null;
-      if (view.showSpectrum && view.mode === 'roll' && clock) {
+      if (view.spectrumMode !== 'none' && view.mode === 'roll' && clock) {
         const now = performance.now();
         if (clock.isPlaying) lastSounding = now;
         if (now - lastSounding < 1500) {
@@ -287,7 +322,7 @@ export function App(): JSX.Element {
       // below what the canvas can show.
       const key = `${Math.round(projectSeconds * view.pixelsPerSecond * 4)}|`
         + `${Math.round(scrollTopRef.current)}|${view.pixelsPerSecond}|${view.mode}|`
-        + `${view.bounceOffset}|${view.showSpectrum}|${spectrum ? spectrumFrame : 0}|${dirtyRef.current}`;
+        + `${view.bounceOffset}|${view.spectrumMode}|${spectrum ? spectrumFrame : 0}|${view.topInset}|${dirtyRef.current}`;
       if (key !== lastKey) {
         lastKey = key;
         const state = {
@@ -300,6 +335,9 @@ export function App(): JSX.Element {
           bouncePeaks: bouncePeaksRef.current,
           bounceOffset: view.bounceOffset,
           spectrum,
+          spectrumMode: view.spectrumMode,
+          spectrumLive: clock?.isPlaying ?? false,
+          topInset: view.topInset,
         };
         const roll = rollRendererRef.current;
         if (view.mode === 'roll' && roll && rollScene) roll.draw(rollScene, state);
@@ -334,8 +372,12 @@ export function App(): JSX.Element {
   // Keyboard + wheel.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.target instanceof HTMLInputElement) return;
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
       if (event.code === 'Space') { event.preventDefault(); togglePlay(); }
+      // Matched on the character too, so it follows the keyboard layout.
+      if ((event.key === 'h' || event.key === 'H' || event.code === 'KeyH') && !event.metaKey && !event.ctrlKey && !event.altKey) {
+        setHeaderHidden((hidden) => !hidden);
+      }
       if (event.code === 'Home') { clockRef.current?.seek(0); }
     };
     window.addEventListener('keydown', onKey);
@@ -400,85 +442,6 @@ export function App(): JSX.Element {
 
   return (
     <div className="app">
-      <div className="titlebar">{project ? project.projectName : 'Logic Visualizer'}</div>
-
-      <div className="toolbar">
-        <button className="primary" onClick={() => void openProject()} disabled={busy}>Open project…</button>
-        <button onClick={() => void reloadProject()} disabled={!project || busy}>Reload</button>
-        <button onClick={() => void openBounce()} disabled={busy}>
-          {bounceName ? 'Change bounce…' : 'Import bounce…'}
-        </button>
-
-        <span className="spacer" />
-
-        <button onClick={togglePlay} disabled={!project}>{playing ? 'Pause' : 'Play'}</button>
-        <button onClick={() => clockRef.current?.seek(0)} disabled={!project}>Start</button>
-        <span className="readout" ref={positionRef}>0:00.00</span>
-        <span className="readout tempo" ref={tempoRef}>
-          {project ? `${project.baseBpm} BPM` : '— BPM'}
-        </span>
-        {project && (
-          <span className="readout" title="Key and time signature">
-            {formatKey(project.songKey, project.songScale)}
-            {' · '}
-            {formatMeter(project)}
-          </span>
-        )}
-
-        <label className="field">
-          offset
-          <input
-            type="number"
-            step="0.01"
-            value={bounceOffset}
-            onChange={(e) => setBounceOffset(Number(e.target.value) || 0)}
-          />
-        </label>
-        <label className="field">
-          speed
-          <input
-            type="number"
-            step="0.05"
-            min="0.1"
-            max="4"
-            value={rate}
-            onChange={(e) => {
-              const next = Number(e.target.value) || 1;
-              setRate(next);
-              clockRef.current?.setRate(next);
-            }}
-          />
-        </label>
-
-        <button
-          className={mode === 'arrange' ? 'active' : ''}
-          onClick={() => setMode('arrange')}
-        >Arrange</button>
-        <button
-          className={mode === 'stylized' ? 'active' : ''}
-          onClick={() => setMode('stylized')}
-        >Stylized</button>
-        <button
-          className={mode === 'roll' ? 'active' : ''}
-          onClick={() => setMode('roll')}
-        >Piano roll</button>
-        {mode === 'roll' && (
-          <>
-            <button
-              className={convertAudio ? 'active' : ''}
-              onClick={() => setConvertAudio((on) => !on)}
-              disabled={!project}
-              title="Show audio as its waveform, shifted to its detected pitch (display only)"
-            >Audio→MIDI</button>
-            <button
-              className={showSpectrum ? 'active' : ''}
-              onClick={() => setShowSpectrum((on) => !on)}
-              title="Faint live stereo spectrum of the bounce: left from the bottom, right from the top"
-            >Spectrum</button>
-          </>
-        )}
-      </div>
-
       <div className="stage" ref={stageRef}>
         <canvas ref={canvasRef} />
         {!project && (
@@ -488,12 +451,134 @@ export function App(): JSX.Element {
               Open a <code>.logicx</code> project, then import a bounced mixdown of it.
               The arrangement scrolls past a fixed centre playhead in time with the bounce.
             </p>
-            <p>Space plays · ⌘-scroll zooms · scroll moves vertically · shift-scroll scrubs</p>
+            <p>Space plays · ⌘-scroll zooms · scroll moves vertically · shift-scroll scrubs · H hides the toolbar</p>
           </div>
+        )}
+
+        {headerHidden ? (
+          // Still a drag handle for the window, with a quiet way back.
+          <div className="dragstrip">
+            <button className="icon ghost" onClick={() => setHeaderHidden(false)} title="Show toolbar (H)" aria-label="Show toolbar">
+              <ChevronDownIcon />
+            </button>
+          </div>
+        ) : (
+          <header className="toolbar">
+            <button className="primary" onClick={() => void openProject()} disabled={busy}>Open…</button>
+            <button className="icon" onClick={() => void reloadProject()} disabled={!project || busy} title="Reload project" aria-label="Reload project">
+              <ReloadIcon />
+            </button>
+            <button
+              className={`icon${bounceName ? ' active' : ''}`}
+              onClick={() => void openBounce()}
+              disabled={busy}
+              title={bounceName ? `Change bounce (${bounceName})` : 'Import bounce'}
+              aria-label={bounceName ? 'Change bounce' : 'Import bounce'}
+            >
+              <MusicUploadIcon />
+            </button>
+
+            <span className="spacer" />
+
+            <button className="icon" onClick={togglePlay} disabled={!project} title={playing ? 'Pause (Space)' : 'Play (Space)'} aria-label={playing ? 'Pause' : 'Play'}>
+              {playing ? <PauseIcon /> : <PlayIcon />}
+            </button>
+            <button className="icon" onClick={() => clockRef.current?.seek(0)} disabled={!project} title="Back to start (Home)" aria-label="Back to start">
+              <ToStartIcon />
+            </button>
+            <span className="readout" ref={positionRef}>0:00.00</span>
+            <span className="readout tempo" ref={tempoRef}>
+              {project ? `${project.baseBpm} BPM` : '— BPM'}
+            </span>
+            {project && (
+              <span className="readout key" title="Key and time signature">
+                {formatKey(project.songKey, project.songScale)}
+                {' · '}
+                {formatMeter(project)}
+              </span>
+            )}
+
+            <label className="field" title="Bounce offset, in seconds">
+              offset
+              <input
+                type="number"
+                step="0.01"
+                value={bounceOffset}
+                onChange={(e) => setBounceOffset(Number(e.target.value) || 0)}
+              />
+            </label>
+            <label className="field speed" title="Playback speed">
+              speed
+              <input
+                type="number"
+                step="0.05"
+                min="0.1"
+                max="4"
+                value={rate}
+                onChange={(e) => {
+                  const next = Number(e.target.value) || 1;
+                  setRate(next);
+                  clockRef.current?.setRate(next);
+                }}
+              />
+            </label>
+
+            <div className="segmented" role="group" aria-label="View">
+              <button
+                className={`icon${mode === 'arrange' ? ' active' : ''}`}
+                onClick={() => setMode('arrange')}
+                title="Arrange"
+                aria-label="Arrange"
+                aria-pressed={mode === 'arrange'}
+              >
+                <ArrangeIcon />
+              </button>
+              <span className="divider" />
+              <button
+                className={`icon${mode === 'roll' ? ' active' : ''}`}
+                onClick={() => setMode('roll')}
+                title="Piano roll"
+                aria-label="Piano roll"
+                aria-pressed={mode === 'roll'}
+              >
+                <PianoRollIcon />
+              </button>
+            </div>
+            {mode === 'roll' && (
+              <>
+                <button
+                  className={`icon${convertAudio ? ' active' : ''}`}
+                  onClick={() => setConvertAudio((on) => !on)}
+                  disabled={!project}
+                  title="Audio→MIDI: show audio as its waveform, shifted to its detected pitch (display only)"
+                  aria-label="Audio to MIDI"
+                  aria-pressed={convertAudio}
+                >
+                  <AudioToMidiIcon />
+                </button>
+                <select
+                  className="spectrum"
+                  value={spectrumMode}
+                  onChange={(e) => setSpectrumMode(e.target.value as SpectrumMode)}
+                  title="A faint live view of the bounce's spectrum, over everything"
+                  aria-label="Spectrum view"
+                >
+                  {SPECTRUM_MODES.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </>
+            )}
+
+            <button className="icon ghost" onClick={() => setHeaderHidden(true)} title="Hide toolbar (H)" aria-label="Hide toolbar">
+              <ChevronUpIcon />
+            </button>
+          </header>
         )}
       </div>
 
       <div className="statusbar">
+        {project && <span className="project-name">{project.projectName}</span>}
         {error && <span className="error">{error}</span>}
         {!error && status && <span>{status}</span>}
         {project && stats && (

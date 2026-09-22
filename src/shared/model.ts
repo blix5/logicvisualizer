@@ -26,6 +26,8 @@ type RegionBase = {
   lengthBeats: number;
   startSeconds: number;
   endSeconds: number;
+  /** Region mute (not track mute): the region is on the timeline but silent. */
+  muted: boolean;
 };
 
 /** 4 ints per note: [startTicksRelativeToRegion, durationTicks, pitch, velocity]. */
@@ -52,6 +54,16 @@ export type AudioRegionModel = RegionBase & {
   gainDb: number;
   /** Flex on in Logic. */
   flex: boolean;
+  /** Fade lengths, from the region's start and to its end. 0 when there is none. */
+  fadeInSeconds: number;
+  fadeOutSeconds: number;
+  /**
+   * Fade curve, -1..1 with 0 linear, as Logic's -99..99 scaled. Positive eases
+   * (slow near the silent end: "ease in" on a fade-in, "ease out" on a
+   * fade-out); negative is the opposite bow.
+   */
+  fadeInCurve: number;
+  fadeOutCurve: number;
   /**
    * Seconds of SOURCE audio consumed per second of timeline. 1 for an
    * unstretched region; below 1 when Flex slows a loop down to fit, above 1

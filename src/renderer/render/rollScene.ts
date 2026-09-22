@@ -99,7 +99,9 @@ function addMidi(raw: RawNotes, region: MidiRegionModel): void {
 /**
  * Maps a file's transcribed notes into one region: source seconds become
  * timeline seconds through the trim-in and the flex rate, and anything outside
- * the region's bounds is clipped away. Notes outside [low, high] are dropped.
+ * the region's bounds is clipped away. Pitched notes outside [low, high] are
+ * dropped; unpitched hits are clamped into it instead, so a narrow roll still
+ * shows kicks along its bottom and hats along its top.
  */
 function addTranscript(
   raw: RawNotes,
@@ -112,8 +114,10 @@ function addTranscript(
   const sourceIndex = raw.sources.length;
   raw.sources.push(region);
   for (let i = 0; i + TRANSCRIBED_FIELDS <= notes.length; i += TRANSCRIBED_FIELDS) {
-    const pitch = notes[i + 2]!;
-    if (pitch < low || pitch > high) continue;
+    const unpitched = notes[i + 4] === 1;
+    let pitch = notes[i + 2]!;
+    if (unpitched) pitch = Math.max(low, Math.min(high, pitch));
+    else if (pitch < low || pitch > high) continue;
     const from = region.startSeconds + (notes[i]! - region.fileStartSeconds) / rate;
     const to = from + notes[i + 1]! / rate;
     const start = Math.max(from, region.startSeconds);
@@ -174,7 +178,8 @@ export function buildRollScene(model: ProjectModel, transcripts?: TranscriptLook
 
   for (const region of model.regions) {
     const track = audible.get(region.trackId);
-    if (!track) continue;
+    // Muted tracks and muted regions alike: the roll shows what sounds.
+    if (!track || region.muted) continue;
     if (region.kind === 'midi') {
       if (region.noteCount === 0) continue;
       const list = midiByTrack.get(track.id);
@@ -195,9 +200,10 @@ export function buildRollScene(model: ProjectModel, transcripts?: TranscriptLook
     for (const { region } of audio) {
       const notes = region.audioFileId ? transcripts(region.audioFileId) : null;
       if (!notes) continue;
-      for (let i = 2; i < notes.length; i += TRANSCRIBED_FIELDS) {
-        if (notes[i]! < pitchMin) pitchMin = notes[i]!;
-        if (notes[i]! > pitchMax) pitchMax = notes[i]!;
+      for (let i = 0; i + TRANSCRIBED_FIELDS <= notes.length; i += TRANSCRIBED_FIELDS) {
+        if (notes[i + 4] === 1) continue; // hits are clamped in, not fitted to
+        if (notes[i + 2]! < pitchMin) pitchMin = notes[i + 2]!;
+        if (notes[i + 2]! > pitchMax) pitchMax = notes[i + 2]!;
       }
     }
   }

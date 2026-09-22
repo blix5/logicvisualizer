@@ -27,8 +27,12 @@ npm start
 | shift-scroll | scrub |
 | Home | back to bar 1 |
 
-**Arrange** is the Logic-like view; **Stylized** is the same data with glow and
-note flashes at the playhead.
+**Arrange** is the Logic-like view, one lane per track. **Piano roll** puts every
+MIDI note on one pitch axis, with the bounce's waveform along the bottom. Its
+toolbar adds **Audio→MIDI**, which draws audio as its own waveform shifted to its
+detected pitch (unpitched hits sit at fixed low/mid/high rows), and a
+**spectrum** menu of faint live views: stereo lines, mirrored bars, a pitch
+spectrum folded onto the roll's rows, or a spectrogram trail behind the playhead.
 
 The transport readout shows the position and the tempo **at the playhead**,
 which follows the project's tempo map. The status bar shows the project's base

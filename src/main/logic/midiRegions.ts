@@ -64,6 +64,7 @@ export type ParsedMidiRegion = {
   positionTicks: number;
   lengthTicks: number;
   notes: LogicNote[];
+  muted: boolean;
 };
 
 export type MidiPlacement = {
@@ -71,17 +72,22 @@ export type MidiPlacement = {
   trackRef: number;
   trackNumber: number;
   regionRef: number;
+  /** Region mute: +8 cleared while the +32 ref survives. See parseMidiPlacements. */
+  muted: boolean;
 };
 
 const PLACEMENT_SIZE = 80;
 const PLACEMENT_MARKER = 0x20;
 const PLACEMENT_POSITION_OFFSET = 4;
 const PLACEMENT_REGION_REF_OFFSET = 8;
+const PLACEMENT_REGION_MIRROR_OFFSET = 32;
 const PLACEMENT_TRACK_REF_OFFSET = 16;
 const PLACEMENT_TRACK_NUMBER_OFFSET = 20;
 const MAX_PLAUSIBLE_TICK = ARRANGE_TICK_ORIGIN + 10_000_000;
 /** Beyond this a "region" is a pool entry, not something on the timeline. */
 const MAX_PLAUSIBLE_LENGTH_TICKS = 400 * 4 * LOGIC_PPQ;
+/** One sixteenth. Muted candidates shorter than this are stray track records. */
+const MIN_MUTED_LENGTH_TICKS = LOGIC_PPQ / 4;
 
 /**
  * Scans for MIDI placement records. Like the audio scan, this must step one
@@ -102,19 +108,25 @@ export function parseMidiPlacements(buffer: Buffer, maxTrackNumber: number): Mid
 
     const rawPosition = buffer.readUInt32LE(at + PLACEMENT_POSITION_OFFSET);
     const trackNumber = buffer.readUInt8(at + PLACEMENT_TRACK_NUMBER_OFFSET);
-    const regionRef = buffer.readUInt32LE(at + PLACEMENT_REGION_REF_OFFSET);
+    const playRef = buffer.readUInt32LE(at + PLACEMENT_REGION_REF_OFFSET);
+    const regionRef = buffer.readUInt32LE(at + PLACEMENT_REGION_MIRROR_OFFSET);
     if (rawPosition < ARRANGE_TICK_ORIGIN || rawPosition > MAX_PLAUSIBLE_TICK) continue;
     if (trackNumber < 1 || trackNumber > maxTrackNumber) continue;
     if (regionRef === 0) continue;
-    // The ref is mirrored at +32; requiring both to agree rejects most of the
-    // stray 0x20 bytes that happen to precede a plausible-looking u32.
-    if (buffer.readUInt32LE(at + 32) !== regionRef) continue;
+    // Normally the ref is mirrored at +8 and +32, and requiring both to agree
+    // rejects most stray 0x20 bytes. A MUTED region clears +8 and keeps +32
+    // (re_probe14: two identical MIDI regions, the muted one differs only in
+    // +8 = 0). Every track also carries a bar-1 record shaped the same way,
+    // but its +32 names no region cell, so the cell join drops it.
+    const muted = playRef === 0;
+    if (!muted && playRef !== regionRef) continue;
 
     placements.push({
       positionTicks: rawPosition - ARRANGE_TICK_ORIGIN + buffer.readUInt16LE(at + 2) / 65536,
       trackRef: buffer.readUInt32LE(at + PLACEMENT_TRACK_REF_OFFSET),
       trackNumber,
       regionRef,
+      muted,
     });
   }
   return placements;
@@ -209,6 +221,10 @@ export function parseMidiRegions(buffer: Buffer, maxTrackNumber: number): Parsed
     const cell = cellsByOid.get(placement.regionRef);
     if (!cell) continue;
     if (cell.lengthTicks <= 0 || cell.lengthTicks > MAX_PLAUSIBLE_LENGTH_TICKS) continue;
+    // A per-track bar-1 record can land on a cell by accident; across
+    // ~/Music/Logic the four that did were all nameless, noteless and
+    // near-zero length, while every genuine muted region is at least bars long.
+    if (placement.muted && cell.lengthTicks < MIN_MUTED_LENGTH_TICKS) continue;
 
     // The same placement can appear more than once in the scan; one region per
     // (track, position, content) is what the timeline actually shows.
@@ -224,6 +240,7 @@ export function parseMidiRegions(buffer: Buffer, maxTrackNumber: number): Parsed
       positionTicks: placement.positionTicks,
       lengthTicks: cell.lengthTicks,
       notes: clipNotesToRegion(readRegionNotes(buffer, cell.qsve), cell.lengthTicks),
+      muted: placement.muted,
     });
   }
   return regions;
