@@ -291,6 +291,174 @@ select.spectrum option { background: #1a1d24; color: var(--text); }
   border-radius: 8px;
 }
 
+/* ---- recent projects -------------------------------------------------- */
+
+/* The empty-screen quick-access grid: a wrapping row of preview cards. */
+.recent-grid {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 14px;
+  max-width: 760px;
+  margin-top: 4px;
+}
+
+.recent-card {
+  position: relative;
+  width: 208px;
+}
+.recent-open {
+  display: block;
+  width: 100%;
+  padding: 0;
+  text-align: left;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  cursor: pointer;
+  transition: transform 0.12s ease, border-color 0.12s ease;
+}
+.recent-open:hover {
+  transform: translateY(-2px);
+  border-color: rgba(255, 255, 255, 0.22);
+}
+.recent-thumb {
+  position: relative;
+  display: block;
+  aspect-ratio: 16 / 10;
+  background: rgba(255, 255, 255, 0.04);
+}
+.recent-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.recent-thumb-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  opacity: 0.5;
+}
+.recent-badge {
+  position: absolute;
+  bottom: 6px;
+  left: 6px;
+  padding: 2px 6px;
+  font-size: 10px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.6);
+  color: var(--text);
+}
+.recent-meta {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+}
+.recent-name {
+  font-size: 12.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.recent-when {
+  flex: none;
+  font-size: 11px;
+  color: var(--muted);
+}
+.recent-card.unavailable .recent-open { opacity: 0.45; }
+
+.recent-remove {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 6px;
+  border-color: transparent;
+  background: rgba(0, 0, 0, 0.55);
+  color: var(--muted);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.recent-card:hover .recent-remove { opacity: 1; }
+.recent-remove:hover { color: var(--text); }
+
+/* The toolbar dropdown. Positioned fixed (the toolbar clips its overflow). */
+.recent-menu-root { position: relative; display: inline-flex; }
+.recent-menu {
+  position: fixed;
+  z-index: 10;
+  width: 300px;
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 6px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+  -webkit-app-region: no-drag;
+}
+.recent-menu-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+/* Dense card variant for the dropdown: thumbnail beside the name, one row each. */
+.recent-card.dense { width: auto; }
+.recent-card.dense .recent-open {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+}
+.recent-card.dense .recent-open:hover {
+  transform: none;
+  background: rgba(255, 255, 255, 0.06);
+}
+.recent-card.dense .recent-thumb {
+  flex: none;
+  width: 72px;
+  aspect-ratio: 16 / 10;
+  border-radius: 5px;
+  overflow: hidden;
+}
+.recent-card.dense .recent-meta {
+  flex: 1;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 6px 8px 6px 0;
+  min-width: 0;
+}
+.recent-card.dense .recent-name { max-width: 170px; }
+.recent-card.dense .recent-remove { top: 50%; transform: translateY(-50%); background: transparent; }
+
+.recent-menu-new {
+  width: 100%;
+  margin-top: 6px;
+  padding: 8px;
+  text-align: center;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text);
+  cursor: pointer;
+}
+.recent-menu-new:hover { background: rgba(255, 255, 255, 0.1); }
+
 .statusbar {
   flex: none;
   display: flex;

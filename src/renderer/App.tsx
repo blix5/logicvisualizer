@@ -16,6 +16,7 @@ import {
   SparklesIcon,
   ToStartIcon,
 } from './components/icons';
+import { RecentGrid, RecentMenu, useRecentProjects } from './components/RecentProjects';
 import { TranscriptionStore } from './audio/TranscriptionStore';
 import { reduceBufferPeaks } from './audio/reducePeaks';
 import { ArrangeRenderer, type RenderMode, type StereoSpectrum } from './render/ArrangeRenderer';
@@ -86,6 +87,7 @@ export function App(): JSX.Element {
   const [particles, setParticles] = useState(false);
   /** Bumped as transcriptions land, which rebuilds the roll scene. */
   const [transcriptVersion, setTranscriptVersion] = useState(0);
+  const { recents, record: recordRecent, remove: removeRecent } = useRecentProjects();
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -201,12 +203,10 @@ export function App(): JSX.Element {
     transcriptStoreRef.current?.start();
   }, [convertAudio, project, ensureClock]);
 
-  const openProject = useCallback(async () => {
-    const picked = await window.lv.project.pick();
-    if (!picked) return;
+  const loadProject = useCallback(async (selectionPath: string) => {
     setBusy(true);
     setError(null);
-    const result = await window.lv.project.load(picked);
+    const result = await window.lv.project.load(selectionPath);
     setBusy(false);
     if (isFailure(result)) { setError(result.error); return; }
     setProject(result);
@@ -214,8 +214,19 @@ export function App(): JSX.Element {
     ensureClock().seek(0);
     peakStoreRef.current?.load(result.audioFiles);
     queueTranscripts(result);
+    recordRecent({ path: result.projectPath, name: result.projectName, lastOpened: Date.now() });
     setStatus(`Loaded ${result.projectName}`);
-  }, [ensureClock, queueTranscripts]);
+  }, [ensureClock, queueTranscripts, recordRecent]);
+
+  const openProject = useCallback(async () => {
+    const picked = await window.lv.project.pick();
+    if (!picked) return;
+    await loadProject(picked);
+  }, [loadProject]);
+
+  const openRecent = useCallback((selectionPath: string) => {
+    void loadProject(selectionPath);
+  }, [loadProject]);
 
   const reloadProject = useCallback(async () => {
     if (!project) return;
@@ -454,8 +465,9 @@ export function App(): JSX.Element {
           <div className="empty">
             <h1>No project open</h1>
             <button className="primary open" onClick={() => void openProject()} disabled={busy}>
-              Open project…
+              Open new .logicx
             </button>
+            <RecentGrid recents={recents} onOpen={openRecent} onRemove={removeRecent} />
             <p>
               Open a <code>.logicx</code> project, then import a bounced mixdown of it.
               The arrangement scrolls past a fixed centre playhead in time with the bounce.
@@ -473,7 +485,13 @@ export function App(): JSX.Element {
           </div>
         ) : (
           <header className="toolbar">
-            <button className="primary" onClick={() => void openProject()} disabled={busy}>Open…</button>
+            <RecentMenu
+              recents={recents}
+              onOpen={openRecent}
+              onRemove={removeRecent}
+              onOpenNew={() => void openProject()}
+              disabled={busy}
+            />
             <button className="icon" onClick={() => void reloadProject()} disabled={!project || busy} title="Reload project" aria-label="Reload project">
               <ReloadIcon />
             </button>

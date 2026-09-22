@@ -51,6 +51,7 @@ for (let i = 0; i < 40; i += 1) {
 
 const checks = {
   'toolbar buttons': await evaluate(`[...document.querySelectorAll('.toolbar button')].map(b=>b.textContent).join('|')`),
+  'open affordance': await evaluate(`(!!document.querySelector('.toolbar button[aria-label="Open project"]') && (document.querySelector('.empty button.open')?.textContent ?? '')) || 'none'`),
   'canvas size': await evaluate(`(()=>{const c=document.querySelector('canvas');return c?c.width+'x'+c.height:'none'})()`),
   'canvas painted': await evaluate(`(()=>{const c=document.querySelector('canvas');if(!c)return false;const d=c.getContext('2d').getImageData(0,0,c.width,c.height).data;for(let i=0;i<d.length;i+=4){if(d[i]||d[i+1]||d[i+2])return true}return false})()`),
   'empty state': await evaluate(`document.querySelector('.empty h1')?.textContent ?? 'none'`),
@@ -88,7 +89,7 @@ let ok = true;
 for (const [name, value] of Object.entries(checks)) {
   console.log(`  ${name}: ${value}`);
 }
-if (!checks['toolbar buttons']?.includes('Open project')) { console.error('FAIL: toolbar missing'); ok = false; }
+if (!checks['open affordance']?.includes('Open new .logicx')) { console.error('FAIL: open affordance missing'); ok = false; }
 if (checks['canvas size'] === 'none' || checks['canvas size'] === '0x0') { console.error('FAIL: canvas not sized'); ok = false; }
 if (checks['canvas painted after load'] !== true) { console.error('FAIL: canvas never painted'); ok = false; }
 
