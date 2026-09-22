@@ -84,6 +84,14 @@ export const AudioToMidiIcon = () => (
   </Icon>
 );
 
+/** Two four-point sparkles: playhead particles. */
+export const SparklesIcon = () => (
+  <Icon>
+    <path d="M6 2.5l1.1 3.4L10.5 7 7.1 8.1 6 11.5 4.9 8.1 1.5 7l3.4-1.1z" />
+    <path d="M12 9.5l.6 1.4 1.4.6-1.4.6-.6 1.4-.6-1.4-1.4-.6 1.4-.6z" />
+  </Icon>
+);
+
 export const ChevronUpIcon = () => (
   <Icon>
     <path d="M4 10l4-4 4 4" />

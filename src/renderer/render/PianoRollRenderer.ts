@@ -27,13 +27,28 @@ import {
   type RollTrack,
 } from './rollScene';
 import { VELOCITY_BUCKETS } from './scene';
+import { ParticleSystem } from './particles';
 import { SpectrumPainter } from './spectrum';
 
 const BACKGROUND = '#04050a';
-/** Bar ticks along the very top edge. */
-const TICK_HEIGHT = 4;
-/** Share of the height the roll takes; the bounce strip gets the rest. */
-const ROLL_SHARE = 0.78;
+/** Space above the highest pitch row, on top of whatever the toolbar covers. */
+const TOP_ROOM = 16;
+/**
+ * The bounce shares the roll rather than getting its own strip: the pitch rows
+ * stop this far above the bottom, leaving the band below the lowest notes free
+ * for it. A share of the height, within these bounds.
+ */
+const BOUNCE_SHARE = 0.18;
+const BOUNCE_MIN = 64;
+const BOUNCE_MAX = 150;
+/** Gap between the lowest pitch row and the bounce waveform. */
+const BOUNCE_GAP = 8;
+/**
+ * Particles fire for notes the playhead crossed since the last frame, but only
+ * on steady forward playback: a backwards move or a bigger jump is a seek or a
+ * scrub, and would otherwise set off every note it skipped.
+ */
+const MAX_EMIT_STEP_SECONDS = 0.25;
 const KEY_WIDTH = 14;
 /** Pixels the note glow pass spreads past each note. */
 const GLOW_SPREAD = 3;
@@ -82,7 +97,7 @@ export class PianoRollRenderer {
   // Layout, recomputed with the static layer.
   private layoutKey = '';
   private staticLayer: HTMLCanvasElement | null = null;
-  private rollTop = TICK_HEIGHT;
+  private rollTop = TOP_ROOM;
   private rollBottom = 0;
   private bounceTop = 0;
   private rowHeight = 1;
@@ -95,6 +110,12 @@ export class PianoRollRenderer {
   private gradientKey = '';
 
   private readonly spectrum = new SpectrumPainter();
+  private readonly particles = new ParticleSystem();
+  private particleScene: RollScene | null = null;
+  private lastPlayhead = Number.NaN;
+  /** This frame: whether to emit, and the playhead position emission counts from. */
+  private emitting = false;
+  private emitFrom = 0;
 
   // Envelope scratch, reused every frame.
   private envHigh = new Float32Array(1024);
@@ -149,6 +170,11 @@ export class PianoRollRenderer {
     return canvas;
   }
 
+  /** True while particles are still in flight, so the caller keeps drawing after a pause. */
+  get animating(): boolean {
+    return this.particles.animating;
+  }
+
   clear(): void {
     const width = this.canvas.width / this.dpr;
     const height = this.canvas.height / this.dpr;
@@ -158,14 +184,17 @@ export class PianoRollRenderer {
   }
 
   /** Recomputes layout and repaints the static layer when anything it depends on changed. */
-  private ensureLayout(scene: RollScene, width: number, height: number): void {
-    const key = `${width}|${height}|${this.dpr}|${scene.pitchLow}|${scene.pitchHigh}`;
+  private ensureLayout(scene: RollScene, width: number, height: number, topInset: number): void {
+    const key = `${width}|${height}|${this.dpr}|${scene.pitchLow}|${scene.pitchHigh}|${topInset}`;
     if (key === this.layoutKey && this.staticLayer) return;
     this.layoutKey = key;
 
-    this.rollTop = TICK_HEIGHT;
-    this.rollBottom = Math.round(height * ROLL_SHARE);
-    this.bounceTop = this.rollBottom + 1;
+    // rollBottom is the bottom of the PITCH rows; the bounce band sits below it
+    // inside the same roll.
+    const band = Math.round(Math.min(BOUNCE_MAX, Math.max(BOUNCE_MIN, height * BOUNCE_SHARE)));
+    this.rollTop = topInset + TOP_ROOM;
+    this.rollBottom = Math.max(this.rollTop + 40, height - band);
+    this.bounceTop = this.rollBottom + BOUNCE_GAP;
     const span = scene.pitchHigh - scene.pitchLow + 1;
     this.rowHeight = (this.rollBottom - this.rollTop) / span;
     this.noteInset = this.rowHeight > 6 ? 1 : this.rowHeight > 3 ? 0.5 : 0;
@@ -184,12 +213,13 @@ export class PianoRollRenderer {
     ctx.fillStyle = BACKGROUND;
     ctx.fillRect(0, 0, width, height);
 
-    // Deep-blue wash rising from the bottom of the roll.
-    const wash = ctx.createLinearGradient(0, this.rollTop, 0, this.rollBottom);
-    wash.addColorStop(0, 'rgba(40,30,90,0.10)');
-    wash.addColorStop(1, 'rgba(30,60,120,0.18)');
+    // Deep-blue wash rising from the bottom, over the whole roll — the bounce
+    // band included, since it is part of the roll rather than a strip of its own.
+    const wash = ctx.createLinearGradient(0, 0, 0, height);
+    wash.addColorStop(0, 'rgba(40,30,90,0.08)');
+    wash.addColorStop(1, 'rgba(30,60,120,0.2)');
     ctx.fillStyle = wash;
-    ctx.fillRect(0, this.rollTop, width, this.rollBottom - this.rollTop);
+    ctx.fillRect(0, 0, width, height);
 
     // Pitch rows: black-key rows sink slightly, and each C gets a hairline.
     for (let pitch = scene.pitchLow; pitch <= scene.pitchHigh; pitch += 1) {
@@ -213,14 +243,9 @@ export class PianoRollRenderer {
     ctx.fillStyle = 'rgba(255,255,255,0.06)';
     ctx.fillRect(KEY_WIDTH - 1, this.rollTop, 1, this.rollBottom - this.rollTop);
 
-    // Bounce strip: a slightly lifted floor, the divider, and a centre line
-    // that stays visible when no bounce is loaded.
-    ctx.fillStyle = '#06080f';
-    ctx.fillRect(0, this.bounceTop, width, height - this.bounceTop);
-    ctx.fillStyle = 'rgba(140,170,255,0.16)';
-    ctx.fillRect(0, this.rollBottom, width, 1);
-    ctx.fillStyle = 'rgba(255,255,255,0.05)';
-    ctx.fillRect(0, Math.round((this.bounceTop + height) / 2), width, 1);
+    // A faint centre line for the bounce, visible when none is loaded.
+    ctx.fillStyle = 'rgba(255,255,255,0.04)';
+    ctx.fillRect(KEY_WIDTH, Math.round((this.bounceTop + height) / 2), width - KEY_WIDTH, 1);
 
     // Vignette over everything static.
     const vignette = ctx.createRadialGradient(
@@ -268,7 +293,7 @@ export class PianoRollRenderer {
     const { ctx } = this;
     const width = this.canvas.width / this.dpr;
     const height = this.canvas.height / this.dpr;
-    this.ensureLayout(scene, width, height);
+    this.ensureLayout(scene, width, height, view.topInset ?? 0);
     const centreX = width / 2;
     this.ensureGradients(width, height, centreX);
 
@@ -286,6 +311,16 @@ export class PianoRollRenderer {
     const windowStart = playhead - (centreX - KEY_WIDTH) * spp;
     const windowEnd = playhead + (width - centreX) * spp;
     const toX = (seconds: number) => centreX + (seconds - playhead) * pps;
+
+    // Particles belong to one scene (their colours index its tracks) and stop
+    // when switched off.
+    if (!view.particles || scene !== this.particleScene) this.particles.clear();
+    this.particleScene = scene;
+    const moved = playhead - this.lastPlayhead;
+    this.emitting = !!view.particles && moved > 0 && moved <= MAX_EMIT_STEP_SECONDS;
+    this.emitFrom = this.lastPlayhead;
+    this.lastPlayhead = playhead;
+    this.particles.step(performance.now());
 
     this.drawBars(view, toX, width, height, windowStart, windowEnd);
 
@@ -308,6 +343,10 @@ export class PianoRollRenderer {
     this.drawLitKeys(scene);
     const level = this.drawBounce(view, centreX, width, height);
     this.drawPlayhead(centreX, height, level);
+    this.particles.draw(ctx, (color) => {
+      const track = scene.tracks[color];
+      return track ? this.sprite(track.color) : null;
+    });
     if (view.spectrumMode && view.spectrumMode !== 'none') {
       this.spectrum.draw(ctx, view.spectrumMode, view.spectrum ?? null, {
         width,
@@ -531,6 +570,9 @@ export class PianoRollRenderer {
         const drawW = Math.min(width + GLOW_SPREAD, x + Math.max(2, duration * pps)) - drawX;
         if (drawW <= 0) continue;
 
+        if (this.emitting && start > this.emitFrom && start <= playhead) {
+          this.particles.emit(toX(playhead), y + noteHeight / 2, t, track.bucket[i]! / (VELOCITY_BUCKETS - 1), pps);
+        }
         if (playhead >= start && playhead <= start + duration) {
           const slot = this.flashes.size;
           if (slot >= this.flashTrack.length) {
@@ -616,6 +658,9 @@ export class PianoRollRenderer {
       const centre = rowTop + this.rowHeight / 2;
       const sounding = playhead >= start && playhead <= start + duration;
       const strength = track.bucket[i]! / (VELOCITY_BUCKETS - 1);
+      if (this.emitting && start > this.emitFrom && start <= playhead) {
+        this.particles.emit(toX(playhead), centre, t, strength, pps);
+      }
 
       ctx.fillStyle = this.shade(track.color, sounding ? 0.35 : 0.16);
       ctx.fillRect(left, rowTop + this.noteInset, right - left, noteHeight);
@@ -729,19 +774,21 @@ export class PianoRollRenderer {
     const pyramid = view.bouncePeaks;
     if (!pyramid || !this.bounceFill) return 0;
     const { ctx } = this;
-    const top = this.bounceTop + 4;
-    const bottom = height - 4;
+    const top = this.bounceTop;
+    const bottom = height - 8;
     const centre = (top + bottom) / 2;
     const amplitude = (bottom - top) / 2;
+    // Lined up with the roll's content, right of the keyboard strip.
+    const left = KEY_WIDTH;
     const count = this.envelope(
-      pyramid, 0, width, 1, centreX, 1 / view.pixelsPerSecond, 1,
+      pyramid, left, width, 1, centreX, 1 / view.pixelsPerSecond, 1,
       view.playheadSeconds + (view.bounceOffset ?? 0),
     );
     if (count === 0) return 0;
     ctx.fillStyle = this.bounceFill;
-    this.fillEnvelope(count, 0, 1, centre, amplitude);
+    this.fillEnvelope(count, left, 1, centre, amplitude);
 
-    const at = Math.min(count - 1, Math.round(centreX));
+    const at = Math.min(count - 1, Math.max(0, Math.round(centreX - left)));
     return Math.min(1, Math.max(Math.abs(this.envHigh[at]!), Math.abs(this.envLow[at]!)));
   }
 

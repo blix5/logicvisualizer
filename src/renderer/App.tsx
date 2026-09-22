@@ -13,6 +13,7 @@ import {
   PianoRollIcon,
   PlayIcon,
   ReloadIcon,
+  SparklesIcon,
   ToStartIcon,
 } from './components/icons';
 import { TranscriptionStore } from './audio/TranscriptionStore';
@@ -82,6 +83,7 @@ export function App(): JSX.Element {
   const [convertAudio, setConvertAudio] = useState(false);
   const [spectrumMode, setSpectrumMode] = useState<SpectrumMode>('none');
   const [headerHidden, setHeaderHidden] = useState(readHeaderHidden);
+  const [particles, setParticles] = useState(false);
   /** Bumped as transcriptions land, which rebuilds the roll scene. */
   const [transcriptVersion, setTranscriptVersion] = useState(0);
 
@@ -110,8 +112,8 @@ export function App(): JSX.Element {
   // The render loop reads these refs directly so it never depends on React
   // re-rendering at frame rate.
   const topInset = headerHidden ? 0 : HEADER_HEIGHT;
-  const viewRef = useRef({ pixelsPerSecond, mode, bounceOffset, spectrumMode, topInset });
-  viewRef.current = { pixelsPerSecond, mode, bounceOffset, spectrumMode, topInset };
+  const viewRef = useRef({ pixelsPerSecond, mode, bounceOffset, spectrumMode, topInset, particles });
+  viewRef.current = { pixelsPerSecond, mode, bounceOffset, spectrumMode, topInset, particles };
 
   const scene = useMemo(
     () => (project ? buildScene(project, LANE_CONFIG) : null),
@@ -286,6 +288,7 @@ export function App(): JSX.Element {
     let lastTempo = '';
     let lastSounding = 0;
     let spectrumFrame = 0;
+    let particleFrame = 0;
     const tick = () => {
       frame = requestAnimationFrame(tick);
       const renderer = rendererRef.current;
@@ -317,12 +320,17 @@ export function App(): JSX.Element {
         }
       }
 
+      // Particles keep moving after a pause; draw every frame until they settle.
+      const roll = rollRendererRef.current;
+      const animating = view.mode === 'roll' && view.particles && (roll?.animating ?? false);
+      if (animating) particleFrame += 1;
+
       // Nothing on screen depends on time beyond where it puts the content, so
       // a paused, untouched view costs nothing. Quarter-pixel granularity is
       // below what the canvas can show.
       const key = `${Math.round(projectSeconds * view.pixelsPerSecond * 4)}|`
         + `${Math.round(scrollTopRef.current)}|${view.pixelsPerSecond}|${view.mode}|`
-        + `${view.bounceOffset}|${view.spectrumMode}|${spectrum ? spectrumFrame : 0}|${view.topInset}|${dirtyRef.current}`;
+        + `${view.bounceOffset}|${view.spectrumMode}|${spectrum ? spectrumFrame : 0}|${view.topInset}|${view.particles}|${animating ? particleFrame : 0}|${dirtyRef.current}`;
       if (key !== lastKey) {
         lastKey = key;
         const state = {
@@ -338,8 +346,8 @@ export function App(): JSX.Element {
           spectrumMode: view.spectrumMode,
           spectrumLive: clock?.isPlaying ?? false,
           topInset: view.topInset,
+          particles: view.particles,
         };
-        const roll = rollRendererRef.current;
         if (view.mode === 'roll' && roll && rollScene) roll.draw(rollScene, state);
         else renderer.draw(scene, state);
       }
@@ -447,6 +455,9 @@ export function App(): JSX.Element {
         {!project && (
           <div className="empty">
             <h1>No project open</h1>
+            <button className="primary open" onClick={() => void openProject()} disabled={busy}>
+              Open project…
+            </button>
             <p>
               Open a <code>.logicx</code> project, then import a bounced mixdown of it.
               The arrangement scrolls past a fixed centre playhead in time with the bounce.
@@ -555,6 +566,15 @@ export function App(): JSX.Element {
                   aria-pressed={convertAudio}
                 >
                   <AudioToMidiIcon />
+                </button>
+                <button
+                  className={`icon${particles ? ' active' : ''}`}
+                  onClick={() => setParticles((on) => !on)}
+                  title="Particles where the playhead meets each note"
+                  aria-label="Particles"
+                  aria-pressed={particles}
+                >
+                  <SparklesIcon />
                 </button>
                 <select
                   className="spectrum"

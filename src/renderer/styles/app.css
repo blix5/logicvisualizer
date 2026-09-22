@@ -70,14 +70,18 @@ body {
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
 }
 
-/* With the toolbar hidden, a thin strip still drags the window. */
+/*
+ * With the toolbar hidden, a strip still drags the window. It is exactly as
+ * tall and as padded as the toolbar, so the show chevron lands where the hide
+ * chevron was.
+ */
 .dragstrip {
   position: absolute;
   top: 0;
   left: 0;
   right: 0;
   z-index: 2;
-  height: 28px;
+  height: 44px;
   display: flex;
   justify-content: flex-end;
   align-items: center;
@@ -220,6 +224,11 @@ select.spectrum option { background: #1a1d24; color: var(--text); }
 }
 .empty h1 { font-size: 17px; font-weight: 600; color: var(--text); margin: 0; }
 .empty p { margin: 0; max-width: 420px; }
+.empty button.open {
+  font-size: 14px;
+  padding: 9px 22px;
+  border-radius: 8px;
+}
 
 .project-name { color: var(--text); }
 

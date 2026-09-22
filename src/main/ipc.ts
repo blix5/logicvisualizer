@@ -1,6 +1,7 @@
 // All ipcMain handlers. Handlers never throw across the boundary — they return
 // { error } so the renderer always has something to show.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { BrowserWindow, dialog, ipcMain } from 'electron';
 
@@ -22,12 +23,24 @@ function failure(error: unknown): { error: string } {
  */
 let openProjectRoot: string | null = null;
 
+/**
+ * Where the project picker opens: Logic's own default save location when it
+ * exists, else the Music folder. Passed on every open so macOS's memory of the
+ * last-used folder does not take over.
+ */
+function logicProjectsFolder(): string {
+  const music = path.join(os.homedir(), 'Music');
+  const logic = path.join(music, 'Logic');
+  return fs.existsSync(logic) ? logic : music;
+}
+
 export function registerIpc(getWindow: () => BrowserWindow | null): void {
   ipcMain.handle(CHANNELS.projectPick, async () => {
     const window = getWindow();
     // openFile + openDirectory together is what makes macOS package bundles
     // like .logicx selectable rather than navigable-into.
     const options: Electron.OpenDialogOptions = {
+      defaultPath: logicProjectsFolder(),
       properties: ['openFile', 'openDirectory'],
       filters: [
         { name: 'Logic Pro projects', extensions: ['logicx'] },

@@ -58,6 +58,8 @@ export type ViewState = {
    * so the ruler stays readable; the piano roll draws underneath on purpose.
    */
   topInset?: number;
+  /** Piano roll: burst particles where the playhead meets each note. */
+  particles?: boolean;
 };
 
 const LANE_LABEL_WIDTH = 168;
