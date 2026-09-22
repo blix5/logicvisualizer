@@ -103,3 +103,17 @@ export const ChevronDownIcon = () => (
     <path d="M4 6l4 4 4-4" />
   </Icon>
 );
+
+/** An open folder: browse for / reopen a project. */
+export const FolderIcon = () => (
+  <Icon>
+    <path d="M1.75 4.25A1.25 1.25 0 0 1 3 3h3l1.5 1.5H13a1.25 1.25 0 0 1 1.25 1.25V11.5A1.25 1.25 0 0 1 13 12.75H3A1.25 1.25 0 0 1 1.75 11.5z" />
+  </Icon>
+);
+
+/** A small ✕: remove a recent project. */
+export const CloseIcon = () => (
+  <Icon>
+    <path d="M4 4l8 8M12 4l-8 8" />
+  </Icon>
+);

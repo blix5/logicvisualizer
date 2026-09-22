@@ -3,11 +3,12 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { BrowserWindow, dialog, ipcMain } from 'electron';
+import { BrowserWindow, dialog, ipcMain, nativeImage } from 'electron';
 
-import { CHANNELS, type AudioFileBytes, type BounceFile } from '../shared/ipc';
+import { CHANNELS, type AudioFileBytes, type BounceFile, type RecentPreview } from '../shared/ipc';
 import type { ProjectModel } from '../shared/model';
 import { buildProjectModel } from './project/buildProject';
+import { resolveLogicPaths } from './logic/logicPaths';
 
 const BOUNCE_EXTENSIONS = ['wav', 'aif', 'aiff', 'mp3', 'm4a', 'caf', 'flac'];
 
@@ -60,6 +61,30 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
       return model;
     } catch (error) {
       return failure(error);
+    }
+  });
+
+  // A downscaled thumbnail for a recent project, read from WindowImage.jpg inside
+  // the bundle. resolveLogicPaths validates the path is a real .logicx and keeps
+  // the read confined to it. Never throws across the boundary: a project that has
+  // moved or has no window image comes back with exists/dataUrl set accordingly.
+  ipcMain.handle(CHANNELS.projectPreview, async (_event, projectPath: string): Promise<RecentPreview> => {
+    try {
+      const paths = resolveLogicPaths(projectPath);
+      if (!paths.projectDataPath) return { exists: false, dataUrl: null };
+      if (!paths.windowImagePath) return { exists: true, dataUrl: null };
+      try {
+        const raw = await fs.promises.readFile(paths.windowImagePath);
+        const thumb = nativeImage.createFromBuffer(raw).resize({ width: 480, quality: 'good' });
+        const dataUrl = `data:image/jpeg;base64,${thumb.toJPEG(72).toString('base64')}`;
+        return { exists: true, dataUrl };
+      } catch {
+        // The bundle is fine; only the image could not be read or decoded.
+        return { exists: true, dataUrl: null };
+      }
+    } catch {
+      // Not a resolvable .logicx anymore (moved, deleted, or never valid).
+      return { exists: false, dataUrl: null };
     }
   });
 
