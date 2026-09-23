@@ -45,7 +45,7 @@ import type {
 } from '../../shared/model';
 import { NOTE_STRIDE } from '../../shared/model';
 import { combineVolumeCurves, type VolumeCurve } from '../../shared/automation';
-import { fallbackTrackColor } from './palette';
+import { fallbackTrackColor } from '../../shared/palette';
 import { flexedBeats, readFileTempo } from '../audio/fileTempo';
 
 const DEFAULT_BPM = 120;

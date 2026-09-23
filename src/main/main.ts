@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { app, BrowserWindow } from 'electron';
+import { registerAppearanceIpc, savedWindowBackground } from './appearance';
 import { registerIpc } from './ipc';
 
 // Set LV_DEBUG_PORT to attach a DevTools client (used by scripts/smoke.mjs to
@@ -19,7 +20,8 @@ function createWindow(): void {
     height: 860,
     minWidth: 900,
     minHeight: 560,
-    backgroundColor: '#0b0d12',
+    // The last theme's background, so the window does not open in the wrong colour.
+    backgroundColor: savedWindowBackground('#0b0d12'),
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 16, y: 18 },
     webPreferences: {
@@ -57,6 +59,7 @@ function createWindow(): void {
 
 app.whenReady().then(() => {
   registerIpc(() => mainWindow);
+  registerAppearanceIpc(() => mainWindow);
   createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

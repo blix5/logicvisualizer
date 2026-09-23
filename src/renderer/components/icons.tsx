@@ -127,3 +127,13 @@ export const CloseIcon = () => (
     <path d="M4 4l8 8M12 4l-8 8" />
   </Icon>
 );
+
+/** A painter's palette: themes and colours. */
+export const PaletteIcon = () => (
+  <Icon>
+    <path d="M8 1.75a6.25 6.25 0 0 0 0 12.5c.85 0 1.35-.55 1.35-1.25 0-.4-.2-.7-.4-1s-.4-.6-.4-1c0-.7.55-1.25 1.25-1.25h1.6a3.35 3.35 0 0 0 3.35-3.35C14.75 3.95 11.7 1.75 8 1.75z" />
+    <circle cx="4.75" cy="7.5" r="0.6" fill="currentColor" />
+    <circle cx="6.25" cy="4.75" r="0.6" fill="currentColor" />
+    <circle cx="9.5" cy="4.5" r="0.6" fill="currentColor" />
+  </Icon>
+);

@@ -17,6 +17,8 @@ import { fadeGain, hasFade } from './fade';
 import { volumeGain, type VolumeCurve } from '../../shared/automation';
 import { RectBuffer } from './rectBuffer';
 import type { SpectrumMode } from './spectrum';
+import type { Backdrop } from './backdrop';
+import { DEFAULT_CANVAS_THEME, type CanvasTheme } from '../theme/themes';
 import {
   NOTE_FIELDS,
   LEVEL_STEPS,
@@ -68,14 +70,10 @@ export type ViewState = {
 
 const LANE_LABEL_WIDTH = 168;
 const RULER_HEIGHT = 26;
-/**
- * Muted regions draw in this grey instead of their track colour, as Logic
- * greys them. An hsl() string so the alpha helpers treat it like any track.
- */
-const MUTED_COLOR = 'hsl(220 8% 52%)';
 /** Clamp margin, so clamped fills never show an edge inside the viewport. */
 const EDGE_MARGIN = 8;
-const BACKGROUND = '#0b0d12';
+/** Opacity of the lane, ruler and label grounds over a background image. */
+const BACKDROP_VEIL = 0.55;
 
 export function withAlpha(color: string, alpha: number): string {
   // Track colours are hsl(...) strings; hsl() accepts a slash-alpha suffix.
@@ -88,6 +86,11 @@ export class ArrangeRenderer {
   private dpr = 1;
 
   private readonly alphaCache = new Map<string, string>();
+  private theme: CanvasTheme = DEFAULT_CANVAS_THEME;
+  /** The background image, when this view shows one. */
+  private backdrop: Backdrop | null = null;
+  /** Opacity of the grounds drawn over the backdrop: 1 without one. */
+  private veil = 1;
   /** One buffer per (automation level, velocity bucket); see noteBufferIndex. */
   private readonly noteBuckets: RectBuffer[] =
     Array.from({ length: NOTE_BUFFER_COUNT }, () => new RectBuffer());
@@ -111,6 +114,33 @@ export class ArrangeRenderer {
     this.canvas.style.height = `${height}px`;
   }
 
+  setTheme(theme: CanvasTheme): void {
+    if (theme === this.theme) return;
+    this.theme = theme;
+    // Keyed by colour string; the old theme's track colours will not recur.
+    this.alphaCache.clear();
+  }
+
+  /** The background image to draw under this view, or null for none. */
+  setBackdrop(backdrop: Backdrop | null): void {
+    this.backdrop = backdrop;
+  }
+
+  /** The background: the backdrop layer when there is one, else the theme's colour. */
+  private paintBackground(): void {
+    const { ctx, canvas } = this;
+    const layer = this.backdrop?.layerFor(canvas.width, canvas.height, this.dpr, this.theme.arrangeBg) ?? null;
+    this.veil = layer ? BACKDROP_VEIL : 1;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    if (layer) {
+      ctx.drawImage(layer, 0, 0);
+    } else {
+      ctx.fillStyle = this.theme.arrangeBg;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+  }
+
   private shade(color: string, alpha: number): string {
     const key = `${color}|${alpha}`;
     let value = this.alphaCache.get(key);
@@ -123,11 +153,9 @@ export class ArrangeRenderer {
 
   /** Paints the background only. Used before a project is open. */
   clear(): void {
-    const width = this.canvas.width / this.dpr;
-    const height = this.canvas.height / this.dpr;
-    this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    this.ctx.fillStyle = BACKGROUND;
-    this.ctx.fillRect(0, 0, width, height);
+    this.ctx.globalCompositeOperation = 'source-over';
+    this.ctx.globalAlpha = 1;
+    this.paintBackground();
   }
 
   draw(scene: Scene, view: ViewState): void {
@@ -136,12 +164,10 @@ export class ArrangeRenderer {
     const inset = view.topInset ?? 0;
     const height = this.canvas.height / this.dpr - inset;
 
-    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     ctx.globalCompositeOperation = 'source-over';
     ctx.globalAlpha = 1;
     ctx.shadowBlur = 0;
-    ctx.fillStyle = BACKGROUND;
-    ctx.fillRect(0, 0, width, height + inset);
+    this.paintBackground();
     // Everything below is laid out from y = 0 as before, just shifted down.
     ctx.translate(0, inset);
 
@@ -180,8 +206,10 @@ export class ArrangeRenderer {
     const { ctx } = this;
     const laneTop = lane.top;
 
-    ctx.fillStyle = '#12151d';
+    ctx.globalAlpha = this.veil;
+    ctx.fillStyle = this.theme.laneBg;
     ctx.fillRect(0, laneTop, width, lane.height);
+    ctx.globalAlpha = 1;
 
     for (const buffer of this.noteBuckets) buffer.reset();
     this.waveform.reset();
@@ -223,8 +251,11 @@ export class ArrangeRenderer {
     windowEnd: number,
   ): void {
     const { ctx } = this;
-    ctx.fillStyle = '#0e1117';
+    const { theme } = this;
+    ctx.globalAlpha = this.veil;
+    ctx.fillStyle = theme.rulerBg;
     ctx.fillRect(0, 0, width, RULER_HEIGHT);
+    ctx.globalAlpha = 1;
     ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
     ctx.textBaseline = 'middle';
 
@@ -245,13 +276,13 @@ export class ArrangeRenderer {
       if (entry.seconds > windowEnd) break;
       const x = toX(entry.seconds);
       const major = (entry.bar - 1) % 4 === 0;
-      ctx.strokeStyle = major ? 'rgba(255,255,255,0.14)' : 'rgba(255,255,255,0.05)';
+      ctx.strokeStyle = major ? theme.gridMajor : theme.gridMinor;
       ctx.beginPath();
       ctx.moveTo(Math.round(x) + 0.5, RULER_HEIGHT);
       ctx.lineTo(Math.round(x) + 0.5, height);
       ctx.stroke();
       if (major) {
-        ctx.fillStyle = 'rgba(255,255,255,0.55)';
+        ctx.fillStyle = theme.rulerText;
         ctx.fillText(String(entry.bar), x + 4, RULER_HEIGHT / 2);
       }
     }
@@ -274,7 +305,7 @@ export class ArrangeRenderer {
     const muted = region.muted || lane.muted;
     const active = !muted
       && view.playheadSeconds >= region.startSeconds && view.playheadSeconds <= region.endSeconds;
-    const color = muted ? MUTED_COLOR : lane.color;
+    const color = muted ? this.theme.muted : lane.color;
 
     // A region is as wide as it is long: at 800 px/s a five-minute region is
     // 240k px. Only the visible slice is ever painted.
@@ -395,7 +426,7 @@ export class ArrangeRenderer {
     const x = toX(region.startSeconds);
     const w = Math.max(2, (region.endSeconds - region.startSeconds) * view.pixelsPerSecond);
     if (w <= 46) return;
-    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.fillStyle = this.theme.regionText;
     ctx.font = '10px ui-sans-serif, system-ui, sans-serif';
     ctx.textBaseline = 'top';
     ctx.save();
@@ -450,7 +481,7 @@ export class ArrangeRenderer {
       this.waveform.fillInto(ctx);
     }
     if (this.mutedWaveform.size > 0 || this.mutedNotes.size > 0) {
-      ctx.fillStyle = this.shade(MUTED_COLOR, 0.45);
+      ctx.fillStyle = this.shade(this.theme.muted, 0.45);
       this.mutedWaveform.fillInto(ctx);
       this.mutedNotes.fillInto(ctx);
     }
@@ -473,20 +504,23 @@ export class ArrangeRenderer {
     ctx.beginPath();
     ctx.rect(0, RULER_HEIGHT, LANE_LABEL_WIDTH, height - RULER_HEIGHT);
     ctx.clip();
-    ctx.fillStyle = 'rgba(8,10,15,0.92)';
+    const { theme } = this;
+    ctx.globalAlpha = this.veil;
+    ctx.fillStyle = theme.labelBg;
     ctx.fillRect(0, RULER_HEIGHT, LANE_LABEL_WIDTH, height - RULER_HEIGHT);
+    ctx.globalAlpha = 1;
     ctx.translate(0, RULER_HEIGHT - view.scrollTop);
     ctx.font = '11px ui-sans-serif, system-ui, sans-serif';
     ctx.textBaseline = 'middle';
     for (const lane of scene.lanes) {
       if (lane.top - view.scrollTop > height || lane.top + lane.height - view.scrollTop < 0) continue;
-      ctx.fillStyle = lane.muted ? MUTED_COLOR : lane.color;
+      ctx.fillStyle = lane.muted ? theme.muted : lane.color;
       ctx.fillRect(0, lane.top + 2, 3, lane.height - 4);
-      ctx.fillStyle = lane.muted ? 'rgba(255,255,255,0.35)' : 'rgba(255,255,255,0.72)';
+      ctx.fillStyle = lane.muted ? theme.laneTextMuted : theme.laneText;
       ctx.fillText(lane.name.slice(0, 26), 10, lane.top + lane.height / 2);
     }
     ctx.restore();
-    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.strokeStyle = theme.laneDivider;
     ctx.beginPath();
     ctx.moveTo(LANE_LABEL_WIDTH + 0.5, RULER_HEIGHT);
     ctx.lineTo(LANE_LABEL_WIDTH + 0.5, height);
@@ -495,7 +529,7 @@ export class ArrangeRenderer {
 
   private drawPlayhead(centreX: number, height: number): void {
     const { ctx } = this;
-    ctx.strokeStyle = '#ff5a5f';
+    ctx.strokeStyle = this.theme.playhead;
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.moveTo(Math.round(centreX) + 0.5, 0);

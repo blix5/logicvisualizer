@@ -17,6 +17,7 @@ import {
   SparklesIcon,
   ToStartIcon,
 } from './components/icons';
+import { AppearanceMenu } from './components/AppearancePanel';
 import { RecentGrid, RecentMenu, useRecentProjects } from './components/RecentProjects';
 import { TranscriptionStore } from './audio/TranscriptionStore';
 import { reduceBufferPeaks } from './audio/reducePeaks';
@@ -27,6 +28,10 @@ import { buildRollScene } from './render/rollScene';
 import { buildScene } from './render/scene';
 import { SPECTRUM_MODES, type SpectrumMode } from './render/spectrum';
 import { AudioClock } from './transport/AudioClock';
+import { Backdrop } from './render/backdrop';
+import { resolveTrackColors } from './theme/palettes';
+import { useAppearance } from './theme/useAppearance';
+import { useBackgroundImage } from './theme/useBackgroundImage';
 
 const LANE_CONFIG = { laneHeight: 44, laneGap: 4 };
 const MIN_PPS = 8;
@@ -89,6 +94,9 @@ export function App(): JSX.Element {
   /** Bumped as transcriptions land, which rebuilds the roll scene. */
   const [transcriptVersion, setTranscriptVersion] = useState(0);
   const { recents, record: recordRecent, remove: removeRecent } = useRecentProjects();
+  const appearance = useAppearance();
+  const { theme, settings: appearanceSettings } = appearance;
+  const backgroundImage = useBackgroundImage();
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -99,6 +107,8 @@ export function App(): JSX.Element {
   const tempoRef = useRef<HTMLSpanElement | null>(null);
   const rendererRef = useRef<ArrangeRenderer | null>(null);
   const rollRendererRef = useRef<PianoRollRenderer | null>(null);
+  /** The background image layer, shared by both renderers. */
+  const backdropRef = useRef(new Backdrop());
   /** The bounce's peaks, read by the frame loop; only the piano roll draws them. */
   const bouncePeaksRef = useRef<PeakPyramid | null>(null);
   /** Bumped per bounce import, so a slow reduction cannot land on a newer bounce. */
@@ -120,20 +130,28 @@ export function App(): JSX.Element {
   const viewRef = useRef({ pixelsPerSecond, mode, bounceOffset, spectrumMode, topInset, particles });
   viewRef.current = { pixelsPerSecond, mode, bounceOffset, spectrumMode, topInset, particles };
 
+  // The project as drawn: track colours from the chosen palette, adapted to the
+  // theme. Only the scenes read it; everything else uses the project as loaded.
+  const drawnProject = useMemo(() => {
+    if (!project) return null;
+    const colors = resolveTrackColors(project.tracks, appearanceSettings.palette, theme);
+    return { ...project, tracks: project.tracks.map((track, i) => ({ ...track, color: colors[i] ?? track.color })) };
+  }, [project, appearanceSettings.palette, theme]);
+
   const scene = useMemo(
-    () => (project ? buildScene(project, LANE_CONFIG) : null),
-    [project],
+    () => (drawnProject ? buildScene(drawnProject, LANE_CONFIG) : null),
+    [drawnProject],
   );
 
   const rollScene = useMemo(() => {
-    if (!project) return null;
+    if (!drawnProject) return null;
     void transcriptVersion;
     const store = transcriptStoreRef.current;
     return buildRollScene(
-      project,
+      drawnProject,
       convertAudio && store ? (audioFileId) => store.get(audioFileId) : undefined,
     );
-  }, [project, convertAudio, transcriptVersion]);
+  }, [drawnProject, convertAudio, transcriptVersion]);
 
   const tempoMap = useMemo(
     () => (project ? buildTempoMap(project.tempoEvents, project.baseBpm) : null),
@@ -335,6 +353,24 @@ export function App(): JSX.Element {
     return () => observer.disconnect();
   }, []);
 
+  // Theme and background image. The frame loop only redraws when its key
+  // changes, so each of these marks the canvas dirty.
+  useEffect(() => {
+    rendererRef.current?.setTheme(theme.canvas);
+    rollRendererRef.current?.setTheme(theme.canvas);
+    dirtyRef.current += 1;
+  }, [theme]);
+
+  useEffect(() => {
+    const backdrop = backdropRef.current;
+    backdrop.setImage(backgroundImage.image);
+    backdrop.setOptions({ opacity: appearanceSettings.background.opacity, blur: appearanceSettings.background.blur });
+    const { showIn } = appearanceSettings.background;
+    rendererRef.current?.setBackdrop(showIn === 'roll' ? null : backdrop);
+    rollRendererRef.current?.setBackdrop(showIn === 'arrange' ? null : backdrop);
+    dirtyRef.current += 1;
+  }, [backgroundImage.image, appearanceSettings.background]);
+
   // The frame loop. Lives outside React entirely.
   useEffect(() => {
     let frame = 0;
@@ -347,7 +383,12 @@ export function App(): JSX.Element {
       const renderer = rendererRef.current;
       if (!renderer) return;
       const view = viewRef.current;
-      if (!scene) { renderer.clear(); return; }
+      if (!scene) {
+        // Only repaint when something changed: the backdrop is a full-canvas blit.
+        const idle = `empty|${dirtyRef.current}`;
+        if (idle !== lastKey) { lastKey = idle; renderer.clear(); }
+        return;
+      }
       const clock = clockRef.current;
       const media = clock ? clock.now() : 0;
       const projectSeconds = media - view.bounceOffset;
@@ -647,19 +688,23 @@ export function App(): JSX.Element {
                 >
                   <SparklesIcon />
                 </button>
-                <select
-                  className="spectrum"
-                  value={spectrumMode}
-                  onChange={(e) => setSpectrumMode(e.target.value as SpectrumMode)}
-                  title="A faint live view of the bounce's spectrum, over everything"
-                  aria-label="Spectrum view"
-                >
-                  {SPECTRUM_MODES.map((option) => (
-                    <option key={option.value} value={option.value}>{option.label}</option>
-                  ))}
-                </select>
+                <span className="select-wrap">
+                  <select
+                    className="spectrum"
+                    value={spectrumMode}
+                    onChange={(e) => setSpectrumMode(e.target.value as SpectrumMode)}
+                    title="A faint live view of the bounce's spectrum, over everything"
+                    aria-label="Spectrum view"
+                  >
+                    {SPECTRUM_MODES.map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
+                  </select>
+                </span>
               </>
             )}
+
+            <AppearanceMenu appearance={appearance} background={backgroundImage} tracks={project?.tracks ?? null} />
 
             <button className="icon ghost" onClick={() => setHeaderHidden(true)} title="Hide toolbar (H)" aria-label="Hide toolbar">
               <ChevronUpIcon />

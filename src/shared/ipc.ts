@@ -32,6 +32,14 @@ export type RecentPreview = {
   hasBounce: boolean;
 };
 
+/** The background image, as stored in app storage. */
+export type BackgroundImage = {
+  name: string;
+  /** MIME type from the file extension, for building a Blob. */
+  type: string;
+  bytes: ArrayBuffer;
+};
+
 export type LvApi = {
   project: {
     pick(): Promise<string | null>;
@@ -59,6 +67,22 @@ export type LvApi = {
     /** Reads a media file from the open project. Path must be inside the bundle. */
     read(filePath: string): Promise<Result<AudioFileBytes>>;
   };
+  appearance: {
+    /**
+     * Picks an image and copies it into app storage as the background,
+     * replacing any previous one. null when the picker is cancelled.
+     */
+    chooseBackground(): Promise<Result<BackgroundImage | null>>;
+    /** The stored background image, or null when there is none. */
+    background(): Promise<Result<BackgroundImage | null>>;
+    clearBackground(): Promise<Result<{ cleared: boolean }>>;
+    /**
+     * Matches the native window to the theme: its background colour (shown
+     * while resizing and on the next launch) and the native appearance of
+     * dialogs and menus.
+     */
+    setWindow(background: string, scheme: 'dark' | 'light' | 'system'): Promise<void>;
+  };
 };
 
 export const CHANNELS = {
@@ -72,4 +96,8 @@ export const CHANNELS = {
   bounceClear: 'bounce:clear',
   bounceAuto: 'bounce:auto',
   audioRead: 'audio:read',
+  appearanceChooseBackground: 'appearance:chooseBackground',
+  appearanceBackground: 'appearance:background',
+  appearanceClearBackground: 'appearance:clearBackground',
+  appearanceSetWindow: 'appearance:setWindow',
 } as const;

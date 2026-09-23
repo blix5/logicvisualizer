@@ -18,6 +18,12 @@ const api: LvApi = {
   audio: {
     read: (filePath) => ipcRenderer.invoke(CHANNELS.audioRead, filePath),
   },
+  appearance: {
+    chooseBackground: () => ipcRenderer.invoke(CHANNELS.appearanceChooseBackground),
+    background: () => ipcRenderer.invoke(CHANNELS.appearanceBackground),
+    clearBackground: () => ipcRenderer.invoke(CHANNELS.appearanceClearBackground),
+    setWindow: (background, scheme) => ipcRenderer.invoke(CHANNELS.appearanceSetWindow, background, scheme),
+  },
 };
 
 contextBridge.exposeInMainWorld('lv', api);

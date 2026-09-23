@@ -30,8 +30,10 @@ import { LEVEL_STEPS, NOTE_BUFFER_COUNT, noteBufferIndex, VELOCITY_BUCKETS } fro
 import { volumeGain, type VolumeCurve } from '../../shared/automation';
 import { ParticleSystem } from './particles';
 import { SpectrumPainter } from './spectrum';
+import type { Backdrop } from './backdrop';
+import { DEFAULT_CANVAS_THEME, type CanvasTheme } from '../theme/themes';
+import { rgbTriplet } from '../theme/color';
 
-const BACKGROUND = '#04050a';
 /** Space above the highest pitch row, on top of whatever the toolbar covers. */
 const TOP_ROOM = 16;
 /**
@@ -82,6 +84,9 @@ export class PianoRollRenderer {
 
   private readonly alphaCache = new Map<string, string>();
   private readonly spriteCache = new Map<string, HTMLCanvasElement>();
+  private theme: CanvasTheme = DEFAULT_CANVAS_THEME;
+  /** The background image, when this view shows one. */
+  private backdrop: Backdrop | null = null;
   /** One buffer per (automation level, velocity bucket); see noteBufferIndex. */
   private readonly noteBuckets: RectBuffer[] =
     Array.from({ length: NOTE_BUFFER_COUNT }, () => new RectBuffer());
@@ -138,6 +143,22 @@ export class PianoRollRenderer {
     this.layoutKey = '';
   }
 
+  setTheme(theme: CanvasTheme): void {
+    if (theme === this.theme) return;
+    this.theme = theme;
+    // Everything baked from theme colours is stale.
+    this.alphaCache.clear();
+    this.spriteCache.clear();
+    this.layoutKey = '';
+    this.gradientKey = '';
+    this.spectrum.setTheme(theme);
+  }
+
+  /** The background image to draw under this view, or null for none. */
+  setBackdrop(backdrop: Backdrop | null): void {
+    this.backdrop = backdrop;
+  }
+
   private shade(color: string, alpha: number): string {
     const key = `${color}|${alpha}`;
     let value = this.alphaCache.get(key);
@@ -161,7 +182,7 @@ export class PianoRollRenderer {
     if (ctx) {
       const r = size / 2;
       const gradient = ctx.createRadialGradient(r, r, 0, r, r, r);
-      gradient.addColorStop(0, 'rgba(255,255,255,0.95)');
+      gradient.addColorStop(0, this.theme.spriteCore ?? withAlpha(color, 0.95));
       gradient.addColorStop(0.12, withAlpha(color, 0.8));
       gradient.addColorStop(0.4, withAlpha(color, 0.22));
       gradient.addColorStop(1, withAlpha(color, 0));
@@ -181,13 +202,14 @@ export class PianoRollRenderer {
     const width = this.canvas.width / this.dpr;
     const height = this.canvas.height / this.dpr;
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    this.ctx.fillStyle = BACKGROUND;
+    this.ctx.fillStyle = this.theme.rollBg;
     this.ctx.fillRect(0, 0, width, height);
   }
 
   /** Recomputes layout and repaints the static layer when anything it depends on changed. */
   private ensureLayout(scene: RollScene, width: number, height: number, topInset: number): void {
-    const key = `${width}|${height}|${this.dpr}|${scene.pitchLow}|${scene.pitchHigh}|${topInset}`;
+    const backdrop = this.backdrop?.active ? this.backdrop.version : -1;
+    const key = `${width}|${height}|${this.dpr}|${scene.pitchLow}|${scene.pitchHigh}|${topInset}|${backdrop}`;
     if (key === this.layoutKey && this.staticLayer) return;
     this.layoutKey = key;
 
@@ -210,16 +232,22 @@ export class PianoRollRenderer {
     layer.height = this.canvas.height;
     const ctx = layer.getContext('2d', { alpha: false });
     if (!ctx) return;
+    const { theme } = this;
+    const image = this.backdrop?.layerFor(layer.width, layer.height, this.dpr, theme.rollBg) ?? null;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    if (image) {
+      ctx.drawImage(image, 0, 0);
+    } else {
+      ctx.fillStyle = theme.rollBg;
+      ctx.fillRect(0, 0, layer.width, layer.height);
+    }
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
 
-    ctx.fillStyle = BACKGROUND;
-    ctx.fillRect(0, 0, width, height);
-
-    // Deep-blue wash rising from the bottom, over the whole roll — the bounce
-    // band included, since it is part of the roll rather than a strip of its own.
+    // A wash rising from the bottom, over the whole roll — the bounce band
+    // included, since it is part of the roll rather than a strip of its own.
     const wash = ctx.createLinearGradient(0, 0, 0, height);
-    wash.addColorStop(0, 'rgba(40,30,90,0.08)');
-    wash.addColorStop(1, 'rgba(30,60,120,0.2)');
+    wash.addColorStop(0, theme.rollWash[0]);
+    wash.addColorStop(1, theme.rollWash[1]);
     ctx.fillStyle = wash;
     ctx.fillRect(0, 0, width, height);
 
@@ -227,11 +255,11 @@ export class PianoRollRenderer {
     for (let pitch = scene.pitchLow; pitch <= scene.pitchHigh; pitch += 1) {
       const y = this.pitchY[pitch]!;
       if (BLACK_KEYS.has(pitch % 12)) {
-        ctx.fillStyle = 'rgba(0,0,0,0.28)';
+        ctx.fillStyle = theme.blackKeyRow;
         ctx.fillRect(KEY_WIDTH, y, width - KEY_WIDTH, this.rowHeight);
       }
       if (pitch % 12 === 0) {
-        ctx.fillStyle = 'rgba(255,255,255,0.05)';
+        ctx.fillStyle = theme.octaveLine;
         ctx.fillRect(KEY_WIDTH, Math.round(y + this.rowHeight) - 1, width - KEY_WIDTH, 1);
       }
     }
@@ -239,14 +267,14 @@ export class PianoRollRenderer {
     // The keyboard strip.
     for (let pitch = scene.pitchLow; pitch <= scene.pitchHigh; pitch += 1) {
       const y = this.pitchY[pitch]!;
-      ctx.fillStyle = BLACK_KEYS.has(pitch % 12) ? 'rgba(255,255,255,0.03)' : 'rgba(255,255,255,0.09)';
+      ctx.fillStyle = BLACK_KEYS.has(pitch % 12) ? theme.blackKey : theme.whiteKey;
       ctx.fillRect(0, y + 0.5, KEY_WIDTH - 2, Math.max(0.5, this.rowHeight - 1));
     }
-    ctx.fillStyle = 'rgba(255,255,255,0.06)';
+    ctx.fillStyle = theme.keyDivider;
     ctx.fillRect(KEY_WIDTH - 1, this.rollTop, 1, this.rollBottom - this.rollTop);
 
     // A faint centre line for the bounce, visible when none is loaded.
-    ctx.fillStyle = 'rgba(255,255,255,0.04)';
+    ctx.fillStyle = theme.bounceCentre;
     ctx.fillRect(KEY_WIDTH, Math.round((this.bounceTop + height) / 2), width - KEY_WIDTH, 1);
 
     // Vignette over everything static.
@@ -254,8 +282,8 @@ export class PianoRollRenderer {
       width / 2, height / 2, Math.min(width, height) * 0.35,
       width / 2, height / 2, Math.max(width, height) * 0.75,
     );
-    vignette.addColorStop(0, 'rgba(0,0,0,0)');
-    vignette.addColorStop(1, 'rgba(0,0,0,0.55)');
+    vignette.addColorStop(0, theme.vignette[0]);
+    vignette.addColorStop(1, theme.vignette[1]);
     ctx.fillStyle = vignette;
     ctx.fillRect(0, 0, width, height);
 
@@ -266,28 +294,30 @@ export class PianoRollRenderer {
     const key = `${width}|${height}|${this.bounceTop}`;
     if (key === this.gradientKey && this.pastShade && this.bounceFill && this.playheadBand) return;
     this.gradientKey = key;
-    const { ctx } = this;
+    const { ctx, theme } = this;
 
-    // What has already played sinks back; what is coming stays bright.
+    // What has already played sinks back into the ground; what is coming
+    // stays bright.
+    const ground = rgbTriplet(theme.rollBg);
     const past = ctx.createLinearGradient(KEY_WIDTH, 0, centreX, 0);
-    past.addColorStop(0, 'rgba(4,5,10,0.62)');
-    past.addColorStop(0.85, 'rgba(4,5,10,0.18)');
-    past.addColorStop(1, 'rgba(4,5,10,0)');
+    past.addColorStop(0, `rgba(${ground},0.62)`);
+    past.addColorStop(0.85, `rgba(${ground},0.18)`);
+    past.addColorStop(1, `rgba(${ground},0)`);
     this.pastShade = past;
 
     // Hard split at the playhead: played audio dim, upcoming audio lit.
     const split = centreX / width;
     const bounce = ctx.createLinearGradient(0, 0, width, 0);
-    bounce.addColorStop(0, 'rgba(120,140,200,0.14)');
-    bounce.addColorStop(Math.max(0, split - 0.0005), 'rgba(150,170,230,0.32)');
-    bounce.addColorStop(split, 'rgba(190,215,255,0.95)');
-    bounce.addColorStop(1, 'rgba(120,160,255,0.55)');
+    bounce.addColorStop(0, theme.bounce[0]);
+    bounce.addColorStop(Math.max(0, split - 0.0005), theme.bounce[1]);
+    bounce.addColorStop(split, theme.bounce[2]);
+    bounce.addColorStop(1, theme.bounce[3]);
     this.bounceFill = bounce;
 
     const band = ctx.createLinearGradient(centreX - 48, 0, centreX + 48, 0);
-    band.addColorStop(0, 'rgba(255,255,255,0)');
-    band.addColorStop(0.5, 'rgba(210,225,255,0.3)');
-    band.addColorStop(1, 'rgba(255,255,255,0)');
+    band.addColorStop(0, theme.playheadBand[0]);
+    band.addColorStop(0.5, theme.playheadBand[1]);
+    band.addColorStop(1, theme.playheadBand[0]);
     this.playheadBand = band;
   }
 
@@ -331,7 +361,7 @@ export class PianoRollRenderer {
     ctx.beginPath();
     ctx.rect(KEY_WIDTH, this.rollTop, width - KEY_WIDTH, this.rollBottom - this.rollTop);
     ctx.clip();
-    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalCompositeOperation = this.theme.blend;
     this.drawBackgroundAudio(scene, view, toX, width, windowStart, windowEnd);
     this.drawNotes(scene, view, toX, pps, width, playhead, windowStart, windowEnd);
     ctx.globalCompositeOperation = 'source-over';
@@ -345,7 +375,7 @@ export class PianoRollRenderer {
     this.drawLitKeys(scene);
     const level = this.drawBounce(view, centreX, width, height);
     this.drawPlayhead(centreX, height, level);
-    this.particles.draw(ctx, (color) => {
+    this.particles.draw(ctx, this.theme.blend, (color) => {
       const track = scene.tracks[color];
       return track ? this.sprite(track.color) : null;
     });
@@ -397,9 +427,9 @@ export class PianoRollRenderer {
       if ((entry.bar - 1) % 4 === 0) this.majorBars.push(x, 0, 1, height);
       else this.minorBars.push(x, 0, 1, height);
     }
-    ctx.fillStyle = 'rgba(255,255,255,0.035)';
+    ctx.fillStyle = this.theme.barMinor;
     this.minorBars.fillInto(ctx);
-    ctx.fillStyle = 'rgba(150,180,255,0.09)';
+    ctx.fillStyle = this.theme.barMajor;
     this.majorBars.fillInto(ctx);
   }
 
@@ -662,7 +692,7 @@ export class PianoRollRenderer {
     const spp = 1 / pps;
     const noteHeight = Math.max(1.5, this.rowHeight - this.noteInset * 2);
     const amplitude = Math.max(5, this.rowHeight * WAVE_ROWS);
-    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalCompositeOperation = this.theme.blend;
     ctx.lineJoin = 'bevel';
     ctx.lineWidth = GLOW_SPREAD * 2;
 
@@ -742,14 +772,14 @@ export class PianoRollRenderer {
     const waves = this.waveSprites.size;
     if (count === 0 && waves === 0) return;
     const { ctx } = this;
-    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalCompositeOperation = this.theme.blend;
     let current = -1;
     let color = '';
     for (let i = 0; i < count; i += 1) {
       const t = this.flashTrack[i]!;
       if (t !== current) {
         current = t;
-        color = scene.tracks[t]?.color ?? '#ffffff';
+        color = scene.tracks[t]?.color ?? this.theme.muted;
       }
       const x = this.flashes.x(i);
       const y = this.flashes.y(i);
@@ -783,7 +813,7 @@ export class PianoRollRenderer {
 
   private drawLitKeys(scene: RollScene): void {
     const { ctx } = this;
-    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalCompositeOperation = this.theme.blend;
     for (let pitch = scene.pitchLow; pitch <= scene.pitchHigh; pitch += 1) {
       const t = this.litKeys[pitch]!;
       if (t < 0) continue;
@@ -825,14 +855,14 @@ export class PianoRollRenderer {
   private drawPlayhead(centreX: number, height: number, level: number): void {
     const { ctx } = this;
     if (this.playheadBand) {
-      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalCompositeOperation = this.theme.blend;
       ctx.globalAlpha = 0.45 + level * 0.55;
       ctx.fillStyle = this.playheadBand;
       ctx.fillRect(centreX - 48, 0, 96, height);
       ctx.globalAlpha = 1;
       ctx.globalCompositeOperation = 'source-over';
     }
-    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.fillStyle = this.theme.playheadLine;
     ctx.fillRect(Math.round(centreX) - 0.75, 0, 1.5, height);
   }
 }

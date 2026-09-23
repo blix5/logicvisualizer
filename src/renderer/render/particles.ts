@@ -96,10 +96,17 @@ export class ParticleSystem {
     this.live = live;
   }
 
-  /** Draws each live particle as `sprite(color)`, fading and shrinking with age. */
-  draw(ctx: CanvasRenderingContext2D, sprite: (color: number) => CanvasImageSource | null): void {
+  /**
+   * Draws each live particle as `sprite(color)`, fading and shrinking with age,
+   * combined by `blend` (additive on dark themes).
+   */
+  draw(
+    ctx: CanvasRenderingContext2D,
+    blend: GlobalCompositeOperation,
+    sprite: (color: number) => CanvasImageSource | null,
+  ): void {
     if (this.live === 0) return;
-    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalCompositeOperation = blend;
     for (let i = 0; i < POOL; i += 1) {
       const life = this.life[i]!;
       if (life <= 0) continue;

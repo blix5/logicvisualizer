@@ -16,6 +16,7 @@
 // frame, and nothing blurs.
 import type { StereoSpectrum } from './ArrangeRenderer';
 import { RectBuffer } from './rectBuffer';
+import { DEFAULT_CANVAS_THEME, type CanvasTheme } from '../theme/themes';
 
 export type SpectrumMode = 'none' | 'lines' | 'bars' | 'pitch' | 'trail';
 
@@ -79,10 +80,13 @@ const TRAIL_FLOOR = 0.3;
 /** A jump larger than this starts a new run rather than smearing one column. */
 const TRAIL_MAX_FILL = TRAIL_RATE;
 
-/** Channel colours as RGB plus an alpha per element, so edge-fade gradients can be built from them. */
+/**
+ * Channel colours as RGB plus an alpha per element, so edge-fade gradients can
+ * be built from them. The RGB comes from the theme; the alphas are fixed.
+ */
 type Tint = { rgb: string; line: number; fill: number; bar: number; cap: number };
-const LEFT_TINT: Tint = { rgb: '170,205,255', line: 0.26, fill: 0.035, bar: 0.1, cap: 0.4 };
-const RIGHT_TINT: Tint = { rgb: '255,190,215', line: 0.24, fill: 0.03, bar: 0.09, cap: 0.36 };
+const LEFT_ALPHAS = { line: 0.26, fill: 0.035, bar: 0.1, cap: 0.4 };
+const RIGHT_ALPHAS = { line: 0.24, fill: 0.03, bar: 0.09, cap: 0.36 };
 
 /**
  * Soft edges. Every view fades out over this many pixels at the top and bottom
@@ -181,6 +185,10 @@ function pitchBands(centres: Float32Array, halfWidth: number, bins: number, samp
 }
 
 export class SpectrumPainter {
+  private theme: CanvasTheme = DEFAULT_CANVAS_THEME;
+  private leftTint: Tint = { rgb: DEFAULT_CANVAS_THEME.spectrum.left, ...LEFT_ALPHAS };
+  private rightTint: Tint = { rgb: DEFAULT_CANVAS_THEME.spectrum.right, ...RIGHT_ALPHAS };
+
   // shared: horizontal edge fades per tint element, keyed on width
   private axisKey = '';
   private readonly axisGradients = new Map<string, CanvasGradient>();
@@ -235,6 +243,17 @@ export class SpectrumPainter {
   /** Absolute column held by each ring slot, or -1. */
   private readonly trailStamp = new Float64Array(TRAIL_COLUMNS).fill(-1);
   private trailLast = -Infinity;
+
+  setTheme(theme: CanvasTheme): void {
+    if (theme === this.theme) return;
+    this.theme = theme;
+    this.leftTint = { rgb: theme.spectrum.left, ...LEFT_ALPHAS };
+    this.rightTint = { rgb: theme.spectrum.right, ...RIGHT_ALPHAS };
+    // Gradients and the trail's recorded pixels carry the old colours.
+    this.axisGradients.clear();
+    this.pitchGradientKey = '';
+    this.trailKey = '';
+  }
 
   draw(
     ctx: CanvasRenderingContext2D,
@@ -291,8 +310,8 @@ export class SpectrumPainter {
       this.lineBands = logBands(columns, spectrum.left.length, spectrum.sampleRate);
     }
     // From the canvas edges, not the pitch rows: nothing cuts them off.
-    const drewLeft = this.drawLine(ctx, spectrum.left, columns, layout, layout.canvasHeight, -1, LEFT_TINT);
-    const drewRight = this.drawLine(ctx, spectrum.right, columns, layout, 0, 1, RIGHT_TINT);
+    const drewLeft = this.drawLine(ctx, spectrum.left, columns, layout, layout.canvasHeight, -1, this.leftTint);
+    const drewRight = this.drawLine(ctx, spectrum.right, columns, layout, 0, 1, this.rightTint);
     ctx.globalAlpha = 1;
     this.drawChannelLabels(ctx, layout, drewLeft, drewRight);
   }
@@ -340,12 +359,12 @@ export class SpectrumPainter {
     // Just inside the soft edges, clear of the toolbar and the status bar.
     if (left) {
       ctx.textBaseline = 'bottom';
-      ctx.fillStyle = `rgba(${LEFT_TINT.rgb},0.35)`;
+      ctx.fillStyle = `rgba(${this.leftTint.rgb},0.35)`;
       ctx.fillText('L', layout.width - 6, layout.canvasHeight - EDGE_FADE_PX / 2);
     }
     if (right) {
       ctx.textBaseline = 'top';
-      ctx.fillStyle = `rgba(${RIGHT_TINT.rgb},0.35)`;
+      ctx.fillStyle = `rgba(${this.rightTint.rgb},0.35)`;
       ctx.fillText('R', layout.width - 6, layout.rollTop + 3);
     }
   }
@@ -395,14 +414,16 @@ export class SpectrumPainter {
     if (presence <= 0) return;
 
     ctx.globalAlpha = presence;
-    ctx.globalCompositeOperation = 'lighter';
-    ctx.fillStyle = this.axisGradient(ctx, layout, LEFT_TINT, LEFT_TINT.bar);
+    ctx.globalCompositeOperation = this.theme.blend;
+    const left = this.leftTint;
+    const right = this.rightTint;
+    ctx.fillStyle = this.axisGradient(ctx, layout, left, left.bar);
     this.barsLeft.fillInto(ctx);
-    ctx.fillStyle = this.axisGradient(ctx, layout, RIGHT_TINT, RIGHT_TINT.bar);
+    ctx.fillStyle = this.axisGradient(ctx, layout, right, right.bar);
     this.barsRight.fillInto(ctx);
-    ctx.fillStyle = this.axisGradient(ctx, layout, LEFT_TINT, LEFT_TINT.cap);
+    ctx.fillStyle = this.axisGradient(ctx, layout, left, left.cap);
     this.capsLeft.fillInto(ctx);
-    ctx.fillStyle = this.axisGradient(ctx, layout, RIGHT_TINT, RIGHT_TINT.cap);
+    ctx.fillStyle = this.axisGradient(ctx, layout, right, right.cap);
     this.capsRight.fillInto(ctx);
     ctx.globalCompositeOperation = 'source-over';
     ctx.globalAlpha = 1;
@@ -438,9 +459,10 @@ export class SpectrumPainter {
       // Fades with distance from the playhead, so bars read as radiating from it.
       const make = (to: number) => {
         const gradient = ctx.createLinearGradient(layout.centreX, 0, to, 0);
-        gradient.addColorStop(0, 'rgba(210,225,255,0.3)');
-        gradient.addColorStop(0.5, 'rgba(170,195,255,0.12)');
-        gradient.addColorStop(1, 'rgba(150,180,255,0)');
+        const stops = this.theme.spectrum.pitch;
+        gradient.addColorStop(0, stops[0]);
+        gradient.addColorStop(0.5, stops[1]);
+        gradient.addColorStop(1, stops[2]);
         return gradient;
       };
       this.pitchGradientLeft = make(layout.centreX - maxLength);
@@ -486,7 +508,7 @@ export class SpectrumPainter {
     ctx.rect(layout.keyWidth, 0, layout.width - layout.keyWidth, layout.canvasHeight);
     ctx.clip();
     ctx.globalAlpha = presence;
-    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalCompositeOperation = this.theme.blend;
     ctx.fillStyle = this.pitchGradientLeft!;
     this.pitchLeft.fillInto(ctx);
     this.pitchStrongLeft.fillInto(ctx);
@@ -549,6 +571,8 @@ export class SpectrumPainter {
 
     const image = this.trailColumn!;
     const pixels = image.data;
+    const quiet = this.theme.spectrum.trailQuiet;
+    const loud = this.theme.spectrum.trailLoud;
     for (let r = 0; r < this.trailRows; r += 1) {
       const from = this.trailBands.from[r]!;
       const to = this.trailBands.to[r]!;
@@ -557,10 +581,11 @@ export class SpectrumPainter {
       // the full alpha range so real energy reads clearly.
       const lit = n <= TRAIL_FLOOR ? 0 : (n - TRAIL_FLOOR) / (1 - TRAIL_FLOOR);
       const o = r * 4;
-      // Blue at the quiet end, through cyan, to near-white where it is loud.
-      pixels[o] = 90 + 165 * lit * lit;
-      pixels[o + 1] = 150 + 105 * lit;
-      pixels[o + 2] = 255;
+      // Quiet to loud in the theme's colours (on Midnight: blue, through cyan,
+      // to near-white). Red comes in late, which is what passes through cyan.
+      pixels[o] = quiet[0] + (loud[0] - quiet[0]) * lit * lit;
+      pixels[o + 1] = quiet[1] + (loud[1] - quiet[1]) * lit;
+      pixels[o + 2] = quiet[2] + (loud[2] - quiet[2]) * lit;
       // Soft at the canvas edges and the ends of the frequency range.
       this.trailAlpha[r] = Math.sqrt(lit) * 255 * this.trailRowFade[r]!;
     }
@@ -594,7 +619,7 @@ export class SpectrumPainter {
     ctx.beginPath();
     ctx.rect(layout.keyWidth, 0, layout.centreX - layout.keyWidth, layout.canvasHeight);
     ctx.clip();
-    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalCompositeOperation = this.theme.blend;
     ctx.globalAlpha = 0.8;
     ctx.imageSmoothingEnabled = true;
     const top = yOfPitch(layout, this.trailTopPitch);
