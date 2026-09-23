@@ -119,6 +119,23 @@ export function AppearanceMenu({ appearance, background, tracks }: Props): JSX.E
     ? candidate.id === settings.systemDark || candidate.id === settings.systemLight
     : candidate.id === settings.theme);
 
+  const themeCards = (themes: readonly Theme[]) => (
+    <div className="theme-grid">
+      {themes.map((candidate) => (
+        <button
+          key={candidate.id}
+          className={`theme-card${isChosen(candidate) ? ' chosen' : ''}${candidate.id === theme.id ? ' showing' : ''}`}
+          onClick={() => pickTheme(candidate)}
+          aria-pressed={isChosen(candidate)}
+          title={candidate.contrast === 'high' ? `${candidate.name}, high contrast` : `${candidate.name} (${candidate.scheme})`}
+        >
+          <ThemeSwatch theme={candidate} />
+          <span className="theme-name">{candidate.name}</span>
+        </button>
+      ))}
+    </div>
+  );
+
   const setBackground = (patch: Partial<AppearanceSettings['background']>) => update({ background: patch });
 
   return (
@@ -135,7 +152,7 @@ export function AppearanceMenu({ appearance, background, tracks }: Props): JSX.E
         <PaletteIcon />
       </button>
       {open && anchor && (
-        <div className="appearance-panel" role="dialog" aria-label="Appearance" style={{ top: anchor.top, right: anchor.right }}>
+        <div className="appearance-panel" data-scrolls role="dialog" aria-label="Appearance" style={{ top: anchor.top, right: anchor.right }}>
           <section>
             <div className="appearance-heading">
               <h2>Theme</h2>
@@ -156,20 +173,9 @@ export function AppearanceMenu({ appearance, background, tracks }: Props): JSX.E
                 Pick one light and one dark theme; macOS decides which shows.
               </p>
             )}
-            <div className="theme-grid">
-              {THEMES.map((candidate) => (
-                <button
-                  key={candidate.id}
-                  className={`theme-card${isChosen(candidate) ? ' chosen' : ''}${candidate.id === theme.id ? ' showing' : ''}`}
-                  onClick={() => pickTheme(candidate)}
-                  aria-pressed={isChosen(candidate)}
-                  title={`${candidate.name} (${candidate.scheme})`}
-                >
-                  <ThemeSwatch theme={candidate} />
-                  <span className="theme-name">{candidate.name}</span>
-                </button>
-              ))}
-            </div>
+            {themeCards(THEMES.filter((candidate) => candidate.contrast === 'normal'))}
+            <h3>High contrast</h3>
+            {themeCards(THEMES.filter((candidate) => candidate.contrast === 'high'))}
             {following && (
               <label className="toggle">
                 <input

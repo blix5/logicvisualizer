@@ -9,6 +9,7 @@ import {
   AutoBounceIcon,
   ChevronDownIcon,
   ChevronUpIcon,
+  CloseIcon,
   MusicUploadIcon,
   PauseIcon,
   PianoRollIcon,
@@ -18,6 +19,7 @@ import {
   ToStartIcon,
 } from './components/icons';
 import { AppearanceMenu } from './components/AppearancePanel';
+import { Dropdown } from './components/Dropdown';
 import { RecentGrid, RecentMenu, useRecentProjects } from './components/RecentProjects';
 import { TranscriptionStore } from './audio/TranscriptionStore';
 import { reduceBufferPeaks } from './audio/reducePeaks';
@@ -35,7 +37,7 @@ import { useBackgroundImage } from './theme/useBackgroundImage';
 
 const LANE_CONFIG = { laneHeight: 44, laneGap: 4 };
 const MIN_PPS = 8;
-const MAX_PPS = 800;
+const MAX_PPS = 3200;
 
 /** "Ab" + "major" -> "A♭ major". A flat or sharp only follows a note letter. */
 function formatKey(key: string | null, scale: 'major' | 'minor' | null): string {
@@ -57,12 +59,34 @@ function formatMeter(project: ProjectModel): string {
 }
 
 const HEADER_HIDDEN_KEY = 'lv.headerHidden';
+const STATUS_HIDDEN_KEY = 'lv.statusHidden';
 /** Height of the floating toolbar; keep in step with .toolbar in app.css. */
-const HEADER_HEIGHT = 44;
+const HEADER_HEIGHT = 40;
 
-/** Whether the toolbar was hidden last session. Storage can throw; default to shown. */
-function readHeaderHidden(): boolean {
-  try { return window.localStorage.getItem(HEADER_HIDDEN_KEY) === '1'; } catch { return false; }
+/** A flag saved last session. Storage can throw; default to off. */
+function readFlag(key: string): boolean {
+  try { return window.localStorage.getItem(key) === '1'; } catch { return false; }
+}
+function writeFlag(key: string, on: boolean): void {
+  try { window.localStorage.setItem(key, on ? '1' : '0'); } catch { /* per-session only */ }
+}
+
+/** Text fields keep their keys; everything else (buttons, sliders, checkboxes) leaves Space to the transport. */
+function isTextEntry(target: EventTarget | null): boolean {
+  if (target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return true;
+  if (!(target instanceof HTMLInputElement)) return false;
+  return !['range', 'checkbox', 'radio', 'button', 'submit', 'reset', 'color'].includes(target.type);
+}
+
+/** Letter shortcuts, matched on the character too so they follow the keyboard layout. */
+function isShortcut(event: KeyboardEvent, letter: string): boolean {
+  if (event.metaKey || event.ctrlKey || event.altKey) return false;
+  return event.key.toLowerCase() === letter || event.code === `Key${letter.toUpperCase()}`;
+}
+
+/** Text fields in the toolbar let go of focus on Enter or Escape, handing keys back to the transport. */
+function blurOnCommit(event: React.KeyboardEvent<HTMLInputElement>): void {
+  if (event.key === 'Enter' || event.key === 'Escape') event.currentTarget.blur();
 }
 
 function formatTime(seconds: number): string {
@@ -89,7 +113,8 @@ export function App(): JSX.Element {
   /** Piano-roll display options. */
   const [convertAudio, setConvertAudio] = useState(false);
   const [spectrumMode, setSpectrumMode] = useState<SpectrumMode>('none');
-  const [headerHidden, setHeaderHidden] = useState(readHeaderHidden);
+  const [headerHidden, setHeaderHidden] = useState(() => readFlag(HEADER_HIDDEN_KEY));
+  const [statusHidden, setStatusHidden] = useState(() => readFlag(STATUS_HIDDEN_KEY));
   const [particles, setParticles] = useState(false);
   /** Bumped as transcriptions land, which rebuilds the roll scene. */
   const [transcriptVersion, setTranscriptVersion] = useState(0);
@@ -187,9 +212,8 @@ export function App(): JSX.Element {
     return entry && entry.state === 'ready' ? entry.pyramid : null;
   }, []);
 
-  useEffect(() => {
-    try { window.localStorage.setItem(HEADER_HIDDEN_KEY, headerHidden ? '1' : '0'); } catch { /* per-session only */ }
-  }, [headerHidden]);
+  useEffect(() => { writeFlag(HEADER_HIDDEN_KEY, headerHidden); }, [headerHidden]);
+  useEffect(() => { writeFlag(STATUS_HIDDEN_KEY, statusHidden); }, [statusHidden]);
 
   // The title bar is gone, so the project name lives in the window title.
   useEffect(() => {
@@ -472,12 +496,10 @@ export function App(): JSX.Element {
   // Keyboard + wheel.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
+      if (isTextEntry(event.target)) return;
       if (event.code === 'Space') { event.preventDefault(); togglePlay(); }
-      // Matched on the character too, so it follows the keyboard layout.
-      if ((event.key === 'h' || event.key === 'H' || event.code === 'KeyH') && !event.metaKey && !event.ctrlKey && !event.altKey) {
-        setHeaderHidden((hidden) => !hidden);
-      }
+      if (isShortcut(event, 'h')) setHeaderHidden((hidden) => !hidden);
+      if (isShortcut(event, 'i')) setStatusHidden((hidden) => !hidden);
       if (event.code === 'Home') { clockRef.current?.seek(0); }
     };
     window.addEventListener('keydown', onKey);
@@ -488,6 +510,8 @@ export function App(): JSX.Element {
     const stage = stageRef.current;
     if (!stage) return;
     const onWheel = (event: WheelEvent) => {
+      // Menus and panels floating over the canvas scroll themselves.
+      if (event.target instanceof Element && event.target.closest('[data-scrolls]')) return;
       event.preventDefault();
       if (event.metaKey || event.ctrlKey) {
         setPixelsPerSecond((current) => {
@@ -537,7 +561,8 @@ export function App(): JSX.Element {
     const midi = project.regions.filter((r) => r.kind === 'midi');
     const audio = project.regions.filter((r) => r.kind === 'audio');
     const notes = midi.reduce((n, r) => n + (r.kind === 'midi' ? r.noteCount : 0), 0);
-    return { midi: midi.length, audio: audio.length, notes };
+    const flexed = audio.reduce((n, r) => n + (r.kind === 'audio' && r.flex ? 1 : 0), 0);
+    return { midi: midi.length, audio: audio.length, notes, flexed };
   }, [project]);
 
   return (
@@ -557,7 +582,7 @@ export function App(): JSX.Element {
               or auto-bounce it in Logic Pro from the toolbar.
               The arrangement scrolls past a fixed centre playhead in time with the bounce.
             </p>
-            <p>Space plays · ⌘-scroll zooms · scroll moves vertically · shift-scroll scrubs · H hides the toolbar</p>
+            <p>Space plays · ⌘-scroll zooms · scroll moves vertically · shift-scroll scrubs · H hides the toolbar · I hides the status bar</p>
           </div>
         )}
 
@@ -610,28 +635,23 @@ export function App(): JSX.Element {
               <ToStartIcon />
             </button>
             <span className="readout" ref={positionRef}>0:00.00</span>
-            {project && (
-              <span className="readout key" title="Key and time signature">
-                {formatKey(project.songKey, project.songScale)}
-                {' · '}
-                {formatMeter(project)}
-              </span>
-            )}
 
             {/* The centre is taken by the title, which lives outside the toolbar. */}
             <span className="spacer" />
 
-            <label className="field" title="Bounce offset, in seconds">
-              offset
+            <label className="field" title="Bounce offset: shifts the bounce against the arrangement, in seconds">
+              <span className="field-label">Offset</span>
               <input
                 type="number"
                 step="0.01"
                 value={bounceOffset}
                 onChange={(e) => setBounceOffset(Number(e.target.value) || 0)}
+                onKeyDown={blurOnCommit}
               />
+              <span className="field-unit">s</span>
             </label>
             <label className="field speed" title="Playback speed">
-              speed
+              <span className="field-label">Speed</span>
               <input
                 type="number"
                 step="0.05"
@@ -643,7 +663,9 @@ export function App(): JSX.Element {
                   setRate(next);
                   clockRef.current?.setRate(next);
                 }}
+                onKeyDown={blurOnCommit}
               />
+              <span className="field-unit">×</span>
             </label>
 
             <div className="segmented" role="group" aria-label="View">
@@ -688,19 +710,13 @@ export function App(): JSX.Element {
                 >
                   <SparklesIcon />
                 </button>
-                <span className="select-wrap">
-                  <select
-                    className="spectrum"
-                    value={spectrumMode}
-                    onChange={(e) => setSpectrumMode(e.target.value as SpectrumMode)}
-                    title="A faint live view of the bounce's spectrum, over everything"
-                    aria-label="Spectrum view"
-                  >
-                    {SPECTRUM_MODES.map((option) => (
-                      <option key={option.value} value={option.value}>{option.label}</option>
-                    ))}
-                  </select>
-                </span>
+                <Dropdown<SpectrumMode>
+                  options={SPECTRUM_MODES}
+                  value={spectrumMode}
+                  onChange={setSpectrumMode}
+                  title="A faint live view of the bounce's spectrum, over everything"
+                  ariaLabel="Spectrum view"
+                />
               </>
             )}
 
@@ -717,24 +733,45 @@ export function App(): JSX.Element {
           stay put, and stay visible, when it is hidden.
         */}
         <div className="header-title">
-          <span className="title">{project ? project.projectName : 'Logic Visualizer'}</span>
-          <span className="readout tempo" ref={tempoRef}>
-            {project ? `${project.baseBpm} BPM` : '— BPM'}
-          </span>
+          <div className="title-row">
+            <span className="title">{project ? project.projectName : 'Logic Visualizer'}</span>
+            {project && (
+              <span className="readout tempo" ref={tempoRef}>{`${project.baseBpm} BPM`}</span>
+            )}
+          </div>
+          {project && (
+            <div className="readout meta" title="Key and time signature">
+              {formatKey(project.songKey, project.songScale)}
+              {' · '}
+              {formatMeter(project)}
+            </div>
+          )}
         </div>
+
+        {statusHidden && (
+          <button className="icon ghost status-show" onClick={() => setStatusHidden(false)} title="Show status bar (I)" aria-label="Show status bar">
+            <ChevronUpIcon />
+          </button>
+        )}
       </div>
 
+      {!statusHidden && (
       <div className="statusbar">
         {error && <span className="error">{error}</span>}
         {!error && status && <span>{status}</span>}
         {project && stats && (
           <>
-            <span>base {project.baseBpm} BPM</span>
             {project.tempoEvents.length > 1 && <span>{project.tempoEvents.length} tempo changes</span>}
             <span>{project.tracks.length} tracks</span>
             <span>{stats.midi} MIDI regions · {stats.notes} notes</span>
-            <span>{stats.audio} audio regions</span>
-            <span>{pixelsPerSecond.toFixed(0)} px/s</span>
+            <span>
+              {stats.audio} audio regions
+              {stats.flexed > 0 && ` · ${stats.flexed} flexed`}
+            </span>
+            <span>{Math.round(pixelsPerSecond)} px/s</span>
+            {appearance.settings.palette === 'logic' && !project.capabilities.trackColors && (
+              <span>Logic track colours not decoded yet — showing theme colours</span>
+            )}
             {!project.capabilities.audioRegionTracks && project.capabilities.audioRegions && (
               <span className="warn">audio track assignment not yet decoded — audio is on one lane</span>
             )}
@@ -754,7 +791,12 @@ export function App(): JSX.Element {
             ))}
           </>
         )}
+        <span className="spacer" />
+        <button className="icon ghost status-hide" onClick={() => setStatusHidden(true)} title="Hide status bar (I)" aria-label="Hide status bar">
+          <CloseIcon />
+        </button>
       </div>
+      )}
     </div>
   );
 }

@@ -9,12 +9,12 @@
 // Pure and dependency-free — no DOM, no AudioBuffer — so the worker, the
 // main-thread fallback and the unit tests can all share it.
 
-/** Buckets per second at level 0. At MAX_PPS (800) a bucket is two pixels wide. */
-export const PEAK_BASE_RATE = 400;
+/** Buckets per second at level 0. At MAX_PPS (3200) a bucket is two pixels wide. */
+export const PEAK_BASE_RATE = 1600;
 /** Each level is this much coarser than the one below it. */
 export const PEAK_LEVEL_STEP = 4;
-/** 400, 100, 25, 6.25, 1.5625 buckets per second. */
-export const PEAK_LEVELS = 5;
+/** 1600, 400, 100, 25, 6.25, 1.5625 buckets per second. */
+export const PEAK_LEVELS = 6;
 
 export type PeakPyramid = {
   /** One entry per level, interleaved [min, max] per bucket — length = buckets * 2. */

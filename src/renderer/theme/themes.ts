@@ -60,8 +60,8 @@ export type SpectrumTheme = {
 export type CanvasTheme = {
   /**
    * How glows, flashes, particles and stacked waveforms combine. Additive light
-   * works on a dark ground and blows out to white on a light one, where
-   * multiply darkens instead.
+   * works on a dark ground and blows out to white on a light one, so light
+   * themes lay them over instead.
    */
   blend: GlobalCompositeOperation;
 
@@ -261,7 +261,11 @@ function dark(spec: Spec): Theme {
   };
 }
 
-/** A light theme tinted toward `hue`: ink on paper, blending by multiply. */
+/**
+ * A light theme tinted toward `hue`. Glows and flashes are laid over the paper
+ * rather than added (which blows out to white) or multiplied (which reads as
+ * a negative): a lit note is its own bright colour, not a darker one.
+ */
 function light(spec: Spec): Theme {
   const { hue: h, sat: s } = spec;
   const ink = (alpha: number) => `hsl(${h} 30% 12% / ${alpha})`;
@@ -295,7 +299,7 @@ function light(spec: Spec): Theme {
       textShadow: '0 1px 2px rgba(255, 255, 255, 0.7)',
     },
     canvas: {
-      blend: 'multiply',
+      blend: 'source-over',
       arrangeBg: `hsl(${h} ${s}% 94%)`,
       laneBg: `hsl(${h} ${s}% 98.5%)`,
       rulerBg: `hsl(${h} ${s}% 91%)`,
@@ -321,20 +325,20 @@ function light(spec: Spec): Theme {
       barMinor: ink(0.05),
       barMajor: `hsl(${h} 50% 40% / 0.12)`,
       bounce: [
-        `hsl(${h} 35% 45% / 0.16)`,
-        `hsl(${h} 40% 45% / 0.3)`,
-        `hsl(${h} 60% 35% / 0.9)`,
-        `hsl(${h} 60% 45% / 0.5)`,
+        `hsl(${h} 30% 62% / 0.25)`,
+        `hsl(${h} 40% 62% / 0.4)`,
+        `hsl(${h} 75% 56% / 0.95)`,
+        `hsl(${h} 70% 64% / 0.6)`,
       ],
-      playheadBand: [`hsl(${h} 50% 50% / 0)`, `hsl(${h} 50% 50% / 0.22)`],
-      playheadLine: ink(0.85),
+      playheadBand: [`hsl(${h} 90% 72% / 0)`, `hsl(${h} 90% 72% / 0.22)`],
+      playheadLine: ink(0.75),
       spriteCore: null,
       spectrum: {
         left: triplet(left, 70, 45),
         right: triplet(right, 65, 50),
         pitch: [`hsl(${h} 50% 45% / 0.3)`, `hsl(${h} 50% 45% / 0.12)`, `hsl(${h} 50% 45% / 0)`],
-        trailQuiet: rgbOf(h, 70, 60),
-        trailLoud: rgbOf(h, 60, 22),
+        trailQuiet: rgbOf(h, 80, 74),
+        trailLoud: rgbOf(h, 85, 52),
       },
     },
   };
@@ -344,7 +348,7 @@ const DAYLIGHT = light({ id: 'daylight', name: 'Daylight', hue: 225, sat: 20, ac
 
 /** Pure black, white text, a yellow playhead and no decorative washes. */
 const CONTRAST_DARK: Theme = (() => {
-  const base = dark({ id: 'contrast-dark', name: 'High Contrast Dark', hue: 0, sat: 0, accent: '#ffd400', onAccent: '#000', palette: 'contrast' });
+  const base = dark({ id: 'contrast-dark', name: 'Dark', hue: 0, sat: 0, accent: '#ffd400', onAccent: '#000', palette: 'contrast' });
   return {
     ...base,
     contrast: 'high',
@@ -396,7 +400,7 @@ const CONTRAST_DARK: Theme = (() => {
 })();
 
 const CONTRAST_LIGHT: Theme = (() => {
-  const base = light({ id: 'contrast-light', name: 'High Contrast Light', hue: 0, sat: 0, accent: '#0033cc', palette: 'contrast' });
+  const base = light({ id: 'contrast-light', name: 'Light', hue: 0, sat: 0, accent: '#0033cc', palette: 'contrast' });
   return {
     ...base,
     contrast: 'high',

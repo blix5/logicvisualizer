@@ -40,12 +40,12 @@ test('silence reduces to a flat zero envelope', () => {
 
 test('samples beyond full scale clamp instead of wrapping the Int8', () => {
   // Without the clamp, round(2 * 127) = 254 stored into an Int8Array is -2.
-  const pyramid = buildPeakPyramid([channel(1000, (i) => (i % 2 === 0 ? 2 : -2))], 1000);
+  const pyramid = buildPeakPyramid([channel(4000, (i) => (i % 2 === 0 ? 2 : -2))], 4000);
   assert.deepEqual(bucket(pyramid, 0, 0), { min: -127, max: 127 });
 });
 
 test('every channel contributes to the combined envelope', () => {
-  const pyramid = buildPeakPyramid([channel(1000, 1), channel(1000, -1)], 1000);
+  const pyramid = buildPeakPyramid([channel(4000, 1), channel(4000, -1)], 4000);
   assert.deepEqual(bucket(pyramid, 0, 0), { min: -127, max: 127 },
     'the second channel was not folded in');
 });

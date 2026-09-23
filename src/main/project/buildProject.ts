@@ -322,7 +322,6 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
     }
     return tempoByFileId.get(fileId) ?? null;
   }
-  let stretchedCount = 0;
   let flexUnresolved = 0;
 
   for (const region of placed) {
@@ -350,7 +349,6 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
         endSecondsForRegion = beatsToSeconds(tempoMap, startBeat + beats);
         const timelineSeconds = endSecondsForRegion - startSeconds;
         if (timelineSeconds > 0) sourceRate = nativeSeconds / timelineSeconds;
-        stretchedCount += 1;
       } else {
         flexUnresolved += 1;
       }
@@ -389,10 +387,11 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
       lengthApproximate: false,
     });
   }
-  if (stretchedCount > 0 || flexUnresolved > 0) {
+  // Stretching is expected and shows in each region's sourceRate; only a Flex
+  // region that could not be stretched is worth a warning.
+  if (flexUnresolved > 0) {
     warnings.push(
-      `Flex: ${stretchedCount} stretched`
-      + (flexUnresolved > 0 ? `, ${flexUnresolved} at native length (no file tempo)` : ''),
+      `${flexUnresolved} Flex ${flexUnresolved === 1 ? 'region is' : 'regions are'} shown at native length (no file tempo)`,
     );
   }
 

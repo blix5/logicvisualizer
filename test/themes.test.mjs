@@ -76,7 +76,7 @@ test('adaptForTheme keeps colours in range and deepens them on light themes', ()
     for (const l of [20, 58, 85]) {
       const source = formatHsl({ h: hue, s: 60, l });
       const onLight = toHsl(adaptForTheme(source, light));
-      assert.ok(onLight.l >= 31 && onLight.l <= 51, `light ${source} -> ${onLight.l}`);
+      assert.ok(onLight.l >= 41 && onLight.l <= 61, `light ${source} -> ${onLight.l}`);
       const onContrast = toHsl(adaptForTheme(source, contrast));
       assert.ok(onContrast.l >= 54 && onContrast.l <= 69, `contrast ${source} -> ${onContrast.l}`);
     }

@@ -37,13 +37,11 @@ export const MusicUploadIcon = () => (
   </Icon>
 );
 
-/** A note with a lightning bolt: render (auto-bounce) in Logic. */
+/** A waveform landing in a tray: render the mixdown in Logic Pro. */
 export const AutoBounceIcon = () => (
   <Icon>
-    <path d="M6 12V4l5-1.25v6.25" />
-    <circle cx="4.5" cy="12" r="1.5" />
-    <circle cx="9.5" cy="9" r="1.5" />
-    <path d="M13 2.5l-2 3h2l-2 3" />
+    <path d="M4 5.25v1.5M6 3.75v4.5M8 2.25v7.25M10 3.75v4.5M12 5.25v1.5" />
+    <path d="M2 10.75v1.5c0 .7.55 1.25 1.25 1.25h9.5c.7 0 1.25-.55 1.25-1.25v-1.5" />
   </Icon>
 );
 

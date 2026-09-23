@@ -118,12 +118,12 @@ export function adaptForTheme(color: string, theme: Theme): string {
     const l = theme.scheme === 'dark' ? Math.min(68, Math.max(55, hsl.l)) : Math.min(40, Math.max(28, hsl.l * 0.55));
     return formatHsl({ h: hsl.h, s, l });
   }
-  // Light: pastels become mid-tones so notes and regions keep their weight
-  // against paper, where they are multiplied rather than added.
+  // Light: pastels deepen a little and gain saturation so they hold their own
+  // against paper, but stay bright: a lit note should look lit, not inked.
   return formatHsl({
     h: hsl.h,
-    s: Math.min(100, hsl.s * 1.1 + 5),
-    l: Math.min(50, Math.max(32, hsl.l * 0.62)),
+    s: Math.min(100, hsl.s * 1.15 + 5),
+    l: Math.min(60, Math.max(42, hsl.l * 0.8)),
   });
 }
 

@@ -35,7 +35,7 @@ import { DEFAULT_CANVAS_THEME, type CanvasTheme } from '../theme/themes';
 import { rgbTriplet } from '../theme/color';
 
 /** Space above the highest pitch row, on top of whatever the toolbar covers. */
-const TOP_ROOM = 16;
+const TOP_ROOM = 22;
 /**
  * The bounce shares the roll rather than getting its own strip: the pitch rows
  * stop this far above the bottom, leaving the band below the lowest notes free
@@ -45,7 +45,14 @@ const BOUNCE_SHARE = 0.18;
 const BOUNCE_MIN = 64;
 const BOUNCE_MAX = 150;
 /** Gap between the lowest pitch row and the bounce waveform. */
-const BOUNCE_GAP = 8;
+const BOUNCE_GAP = 14;
+/**
+ * Waveforms may spill this far past the pitch rows, into the room above them
+ * and the gap below, so a loud peak at the edge of the range is not cut flat.
+ */
+const ROLL_BLEED = 12;
+/** Space kept clear under the bounce waveform. */
+const BOUNCE_BOTTOM_ROOM = 14;
 /**
  * Particles fire for notes the playhead crossed since the last frame, but only
  * on steady forward playback: a backwards move or a bigger jump is a seek or a
@@ -67,6 +74,8 @@ const MAX_SPRITES = 48;
 const BACKGROUND_BUDGET = 0.32;
 /** Background waveforms sample every other column; nobody can see the difference. */
 const BACKGROUND_STEP = 2;
+/** Opacity of the roll's row stripes and wash over a background image. */
+const BACKDROP_SOFTEN = 0.3;
 const BLACK_KEYS = new Set([1, 3, 6, 8, 10]);
 /**
  * Half-height of a converted note's waveform at full scale, in pitch rows. A
@@ -243,8 +252,13 @@ export class PianoRollRenderer {
     }
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
 
+    // Over a background image the row stripes, wash and vignette fade right
+    // back, or the picture reads as a set of dark bands.
+    const soft = image ? BACKDROP_SOFTEN : 1;
+
     // A wash rising from the bottom, over the whole roll — the bounce band
     // included, since it is part of the roll rather than a strip of its own.
+    ctx.globalAlpha = soft;
     const wash = ctx.createLinearGradient(0, 0, 0, height);
     wash.addColorStop(0, theme.rollWash[0]);
     wash.addColorStop(1, theme.rollWash[1]);
@@ -264,6 +278,8 @@ export class PianoRollRenderer {
       }
     }
 
+    ctx.globalAlpha = 1;
+
     // The keyboard strip.
     for (let pitch = scene.pitchLow; pitch <= scene.pitchHigh; pitch += 1) {
       const y = this.pitchY[pitch]!;
@@ -277,15 +293,17 @@ export class PianoRollRenderer {
     ctx.fillStyle = theme.bounceCentre;
     ctx.fillRect(KEY_WIDTH, Math.round((this.bounceTop + height) / 2), width - KEY_WIDTH, 1);
 
-    // Vignette over everything static.
-    const vignette = ctx.createRadialGradient(
-      width / 2, height / 2, Math.min(width, height) * 0.35,
-      width / 2, height / 2, Math.max(width, height) * 0.75,
-    );
-    vignette.addColorStop(0, theme.vignette[0]);
-    vignette.addColorStop(1, theme.vignette[1]);
-    ctx.fillStyle = vignette;
-    ctx.fillRect(0, 0, width, height);
+    // Vignette over everything static, but not over a background image.
+    if (!image) {
+      const vignette = ctx.createRadialGradient(
+        width / 2, height / 2, Math.min(width, height) * 0.35,
+        width / 2, height / 2, Math.max(width, height) * 0.75,
+      );
+      vignette.addColorStop(0, theme.vignette[0]);
+      vignette.addColorStop(1, theme.vignette[1]);
+      ctx.fillStyle = vignette;
+      ctx.fillRect(0, 0, width, height);
+    }
 
     this.staticLayer = layer;
   }
@@ -356,21 +374,31 @@ export class PianoRollRenderer {
 
     this.drawBars(view, toX, width, height, windowStart, windowEnd);
 
-    // Everything in the roll stays right of the keyboard.
+    // Everything in the roll stays right of the keyboard, and within a little
+    // of the pitch rows.
+    const clipTop = this.rollTop - ROLL_BLEED;
+    const clipHeight = this.rollBottom - this.rollTop + ROLL_BLEED * 2;
     ctx.save();
     ctx.beginPath();
-    ctx.rect(KEY_WIDTH, this.rollTop, width - KEY_WIDTH, this.rollBottom - this.rollTop);
+    ctx.rect(KEY_WIDTH, clipTop, width - KEY_WIDTH, clipHeight);
     ctx.clip();
     ctx.globalCompositeOperation = this.theme.blend;
     this.drawBackgroundAudio(scene, view, toX, width, windowStart, windowEnd);
     this.drawNotes(scene, view, toX, pps, width, playhead, windowStart, windowEnd);
     ctx.globalCompositeOperation = 'source-over';
-    if (this.pastShade) {
+    // Over a background image the shade runs the full height, so it reads as
+    // light falling off rather than a box laid over the picture.
+    const fullShade = !!this.backdrop?.active;
+    if (this.pastShade && !fullShade) {
       ctx.fillStyle = this.pastShade;
-      ctx.fillRect(KEY_WIDTH, this.rollTop, centreX - KEY_WIDTH, this.rollBottom - this.rollTop);
+      ctx.fillRect(KEY_WIDTH, clipTop, centreX - KEY_WIDTH, clipHeight);
     }
     this.drawFlashes(scene, centreX);
     ctx.restore();
+    if (this.pastShade && fullShade) {
+      ctx.fillStyle = this.pastShade;
+      ctx.fillRect(KEY_WIDTH, 0, centreX - KEY_WIDTH, height);
+    }
 
     this.drawLitKeys(scene);
     const level = this.drawBounce(view, centreX, width, height);
@@ -834,7 +862,7 @@ export class PianoRollRenderer {
     if (!pyramid || !this.bounceFill) return 0;
     const { ctx } = this;
     const top = this.bounceTop;
-    const bottom = height - 8;
+    const bottom = height - BOUNCE_BOTTOM_ROOM;
     const centre = (top + bottom) / 2;
     const amplitude = (bottom - top) / 2;
     // Lined up with the roll's content, right of the keyboard strip.

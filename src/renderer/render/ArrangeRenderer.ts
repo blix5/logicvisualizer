@@ -72,8 +72,13 @@ const LANE_LABEL_WIDTH = 168;
 const RULER_HEIGHT = 26;
 /** Clamp margin, so clamped fills never show an edge inside the viewport. */
 const EDGE_MARGIN = 8;
-/** Opacity of the lane, ruler and label grounds over a background image. */
-const BACKDROP_VEIL = 0.55;
+/**
+ * Opacity of the grounds over a background image: lanes barely there so the
+ * image reads as one picture rather than stripes, the ruler and label column
+ * firmer so their text stays legible.
+ */
+const BACKDROP_VEIL = { lane: 0.18, ruler: 0.45, labels: 0.72 } as const;
+const NO_VEIL = { lane: 1, ruler: 1, labels: 1 } as const;
 
 export function withAlpha(color: string, alpha: number): string {
   // Track colours are hsl(...) strings; hsl() accepts a slash-alpha suffix.
@@ -89,8 +94,8 @@ export class ArrangeRenderer {
   private theme: CanvasTheme = DEFAULT_CANVAS_THEME;
   /** The background image, when this view shows one. */
   private backdrop: Backdrop | null = null;
-  /** Opacity of the grounds drawn over the backdrop: 1 without one. */
-  private veil = 1;
+  /** Opacity of the grounds drawn over the backdrop: all 1 without one. */
+  private veil: { lane: number; ruler: number; labels: number } = NO_VEIL;
   /** One buffer per (automation level, velocity bucket); see noteBufferIndex. */
   private readonly noteBuckets: RectBuffer[] =
     Array.from({ length: NOTE_BUFFER_COUNT }, () => new RectBuffer());
@@ -130,7 +135,7 @@ export class ArrangeRenderer {
   private paintBackground(): void {
     const { ctx, canvas } = this;
     const layer = this.backdrop?.layerFor(canvas.width, canvas.height, this.dpr, this.theme.arrangeBg) ?? null;
-    this.veil = layer ? BACKDROP_VEIL : 1;
+    this.veil = layer ? BACKDROP_VEIL : NO_VEIL;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     if (layer) {
       ctx.drawImage(layer, 0, 0);
@@ -206,7 +211,7 @@ export class ArrangeRenderer {
     const { ctx } = this;
     const laneTop = lane.top;
 
-    ctx.globalAlpha = this.veil;
+    ctx.globalAlpha = this.veil.lane;
     ctx.fillStyle = this.theme.laneBg;
     ctx.fillRect(0, laneTop, width, lane.height);
     ctx.globalAlpha = 1;
@@ -252,7 +257,7 @@ export class ArrangeRenderer {
   ): void {
     const { ctx } = this;
     const { theme } = this;
-    ctx.globalAlpha = this.veil;
+    ctx.globalAlpha = this.veil.ruler;
     ctx.fillStyle = theme.rulerBg;
     ctx.fillRect(0, 0, width, RULER_HEIGHT);
     ctx.globalAlpha = 1;
@@ -307,8 +312,8 @@ export class ArrangeRenderer {
       && view.playheadSeconds >= region.startSeconds && view.playheadSeconds <= region.endSeconds;
     const color = muted ? this.theme.muted : lane.color;
 
-    // A region is as wide as it is long: at 800 px/s a five-minute region is
-    // 240k px. Only the visible slice is ever painted.
+    // A region is as wide as it is long: at 3200 px/s a five-minute region is
+    // nearly a million px. Only the visible slice is ever painted.
     const fillX = Math.max(-EDGE_MARGIN, x);
     const fillW = Math.min(width + EDGE_MARGIN, x + w) - fillX;
     if (fillW <= 0) return;
@@ -505,7 +510,7 @@ export class ArrangeRenderer {
     ctx.rect(0, RULER_HEIGHT, LANE_LABEL_WIDTH, height - RULER_HEIGHT);
     ctx.clip();
     const { theme } = this;
-    ctx.globalAlpha = this.veil;
+    ctx.globalAlpha = this.veil.labels;
     ctx.fillStyle = theme.labelBg;
     ctx.fillRect(0, RULER_HEIGHT, LANE_LABEL_WIDTH, height - RULER_HEIGHT);
     ctx.globalAlpha = 1;

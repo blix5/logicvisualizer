@@ -248,7 +248,7 @@ export function RecentMenu({ recents, onOpen, onRemove, onOpenNew, onBounceClear
         <FolderIcon />
       </button>
       {open && anchor && (
-        <div className="recent-menu" role="menu" style={{ top: anchor.top, left: anchor.left }}>
+        <div className="recent-menu" data-scrolls role="menu" style={{ top: anchor.top, left: anchor.left }}>
           {recents.length > 0 && (
             <div className="recent-menu-list">
               {recents.map((entry) => (
