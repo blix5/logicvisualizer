@@ -63,8 +63,11 @@ export type ParsedMidiRegion = {
   /** Ticks from bar 1, taken from the placement record. */
   positionTicks: number;
   lengthTicks: number;
+  /** Pitches as stored in the note block, NOT transposed. */
   notes: LogicNote[];
   muted: boolean;
+  /** Region Transpose in semitones; what Logic plays is note.pitch + transpose. */
+  transpose: number;
 };
 
 export type MidiPlacement = {
@@ -72,8 +75,14 @@ export type MidiPlacement = {
   trackRef: number;
   trackNumber: number;
   regionRef: number;
-  /** Region mute: +8 cleared while the +32 ref survives. See parseMidiPlacements. */
-  muted: boolean;
+  /**
+   * +8 cleared while the +32 ref survives. NOT region mute, whatever it is:
+   * re_probe15's unmuted transposed copy has it. Only used to reject stray
+   * per-track records, which share the shape.
+   */
+  playRefCleared: boolean;
+  /** Region Transpose in semitones (+53, i8). */
+  transpose: number;
 };
 
 const PLACEMENT_SIZE = 80;
@@ -83,11 +92,14 @@ const PLACEMENT_REGION_REF_OFFSET = 8;
 const PLACEMENT_REGION_MIRROR_OFFSET = 32;
 const PLACEMENT_TRACK_REF_OFFSET = 16;
 const PLACEMENT_TRACK_NUMBER_OFFSET = 20;
+// i8 semitones, the region inspector's Transpose. Shared with audio units; see
+// UNIT_TRANSPOSE_OFFSET in logicAudio.ts.
+const PLACEMENT_TRANSPOSE_OFFSET = 53;
 const MAX_PLAUSIBLE_TICK = ARRANGE_TICK_ORIGIN + 10_000_000;
 /** Beyond this a "region" is a pool entry, not something on the timeline. */
 const MAX_PLAUSIBLE_LENGTH_TICKS = 400 * 4 * LOGIC_PPQ;
-/** One sixteenth. Muted candidates shorter than this are stray track records. */
-const MIN_MUTED_LENGTH_TICKS = LOGIC_PPQ / 4;
+/** One sixteenth. Cleared-ref candidates shorter than this are stray track records. */
+const MIN_CLEARED_REF_LENGTH_TICKS = LOGIC_PPQ / 4;
 
 /**
  * Scans for MIDI placement records. Like the audio scan, this must step one
@@ -114,19 +126,22 @@ export function parseMidiPlacements(buffer: Buffer, maxTrackNumber: number): Mid
     if (trackNumber < 1 || trackNumber > maxTrackNumber) continue;
     if (regionRef === 0) continue;
     // Normally the ref is mirrored at +8 and +32, and requiring both to agree
-    // rejects most stray 0x20 bytes. A MUTED region clears +8 and keeps +32
-    // (re_probe14: two identical MIDI regions, the muted one differs only in
-    // +8 = 0). Every track also carries a bar-1 record shaped the same way,
-    // but its +32 names no region cell, so the cell join drops it.
-    const muted = playRef === 0;
-    if (!muted && playRef !== regionRef) continue;
+    // rejects most stray 0x20 bytes. Some placements clear +8 and keep +32.
+    // This was read as region mute from re_probe14, whose muted copy has it,
+    // but re_probe15's UNMUTED transposed copy has it too, and only 1 of the 27
+    // such placements in the corpus has a muted cell. Mute is the cell flag.
+    // Every track also carries a bar-1 record shaped the same way, but its +32
+    // names no region cell, so the cell join drops it.
+    const playRefCleared = playRef === 0;
+    if (!playRefCleared && playRef !== regionRef) continue;
 
     placements.push({
       positionTicks: rawPosition - ARRANGE_TICK_ORIGIN + buffer.readUInt16LE(at + 2) / 65536,
       trackRef: buffer.readUInt32LE(at + PLACEMENT_TRACK_REF_OFFSET),
       trackNumber,
       regionRef,
-      muted,
+      playRefCleared,
+      transpose: buffer.readInt8(at + PLACEMENT_TRANSPOSE_OFFSET),
     });
   }
   return placements;
@@ -224,7 +239,7 @@ export function parseMidiRegions(buffer: Buffer, maxTrackNumber: number): Parsed
     // A per-track bar-1 record can land on a cell by accident; across
     // ~/Music/Logic the four that did were all nameless, noteless and
     // near-zero length, while every genuine muted region is at least bars long.
-    if (placement.muted && cell.lengthTicks < MIN_MUTED_LENGTH_TICKS) continue;
+    if (placement.playRefCleared && cell.lengthTicks < MIN_CLEARED_REF_LENGTH_TICKS) continue;
 
     // The same placement can appear more than once in the scan; one region per
     // (track, position, content) is what the timeline actually shows.
@@ -240,10 +255,10 @@ export function parseMidiRegions(buffer: Buffer, maxTrackNumber: number): Parsed
       positionTicks: placement.positionTicks,
       lengthTicks: cell.lengthTicks,
       notes: clipNotesToRegion(readRegionNotes(buffer, cell.qsve), cell.lengthTicks),
-      // Region mute lives in two places across Logic versions: the placement
-      // (+8 = 0, re_probe14) and the region cell definition (+0x4e bit 0, Logic
-      // Pro 11's djpubichair). Either marks the region muted.
-      muted: placement.muted || cell.muted,
+      // Region mute is on the cell (+0x4e bit 0): djpubichair's bar-65 copies
+      // and re_probe14's muted copy both carry it.
+      muted: cell.muted,
+      transpose: placement.transpose,
     });
   }
   return regions;

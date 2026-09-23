@@ -26,7 +26,8 @@ import {
   type RollScene,
   type RollTrack,
 } from './rollScene';
-import { VELOCITY_BUCKETS } from './scene';
+import { LEVEL_STEPS, NOTE_BUFFER_COUNT, noteBufferIndex, VELOCITY_BUCKETS } from './scene';
+import { volumeGain, type VolumeCurve } from '../../shared/automation';
 import { ParticleSystem } from './particles';
 import { SpectrumPainter } from './spectrum';
 
@@ -81,8 +82,9 @@ export class PianoRollRenderer {
 
   private readonly alphaCache = new Map<string, string>();
   private readonly spriteCache = new Map<string, HTMLCanvasElement>();
+  /** One buffer per (automation level, velocity bucket); see noteBufferIndex. */
   private readonly noteBuckets: RectBuffer[] =
-    Array.from({ length: VELOCITY_BUCKETS }, () => new RectBuffer());
+    Array.from({ length: NOTE_BUFFER_COUNT }, () => new RectBuffer());
   private readonly flashes = new RectBuffer();
   /** Sprites for sounding converted notes: x = track index, y = centre. */
   private readonly waveSprites = new RectBuffer();
@@ -463,20 +465,24 @@ export class PianoRollRenderer {
   }
 
   /**
-   * Tapers the envelope in the scratch arrays by the region's fades. Column n
-   * sits at `left + n * step`; `startX` is where the region starts on screen.
+   * Tapers the envelope in the scratch arrays by the region's fades and the
+   * track's volume automation. Column n sits at `left + n * step`; `startX` is
+   * where the region starts on screen.
    */
-  private applyFades(
+  private applyGain(
     region: AudioRegionModel,
+    volume: VolumeCurve | null,
     count: number,
     left: number,
     step: number,
     startX: number,
     spp: number,
   ): void {
-    if (!hasFade(region)) return;
+    const faded = hasFade(region);
+    if (!faded && !volume) return;
     for (let n = 0; n < count; n += 1) {
-      const gain = fadeGain(region, region.startSeconds + (left + n * step - startX) * spp);
+      const seconds = region.startSeconds + (left + n * step - startX) * spp;
+      const gain = (faded ? fadeGain(region, seconds) : 1) * volumeGain(volume, seconds);
       this.envHigh[n] = this.envHigh[n]! * gain;
       this.envLow[n] = this.envLow[n]! * gain;
     }
@@ -520,7 +526,7 @@ export class PianoRollRenderer {
     const lit = Math.max(0.02, Math.round(share * 200) / 200);
 
     for (let i = from; i < scene.audio.length; i += 1) {
-      const { region, color } = scene.audio[i]!;
+      const { region, color, volume } = scene.audio[i]!;
       if (region.startSeconds > windowEnd) break;
       if (region.endSeconds < windowStart) continue;
       const pyramid = region.audioFileId ? view.peaks(region.audioFileId) : null;
@@ -537,7 +543,7 @@ export class PianoRollRenderer {
         bgRate, region.fileStartSeconds,
         region.reversed, (region.endSeconds - region.startSeconds) * bgRate,
       );
-      this.applyFades(region, count, left, BACKGROUND_STEP, startX, spp);
+      this.applyGain(region, volume, count, left, BACKGROUND_STEP, startX, spp);
       const active = view.playheadSeconds >= region.startSeconds && view.playheadSeconds <= region.endSeconds;
       this.ctx.fillStyle = this.shade(color, active ? lit : idle);
       this.fillEnvelope(count, left, BACKGROUND_STEP, centre, amplitude);
@@ -579,9 +585,13 @@ export class PianoRollRenderer {
         const drawX = Math.max(KEY_WIDTH - GLOW_SPREAD, x);
         const drawW = Math.min(width + GLOW_SPREAD, x + Math.max(2, duration * pps)) - drawX;
         if (drawW <= 0) continue;
+        // Automated to silence: nothing sounds, so nothing is drawn or lit.
+        const level = track.level[i]!;
+        if (level === 0) continue;
 
         if (this.emitting && start > this.emitFrom && start <= playhead) {
-          this.particles.emit(toX(playhead), y + noteHeight / 2, t, track.bucket[i]! / (VELOCITY_BUCKETS - 1), pps);
+          const strength = (track.bucket[i]! / (VELOCITY_BUCKETS - 1)) * (level / LEVEL_STEPS);
+          this.particles.emit(toX(playhead), y + noteHeight / 2, t, strength, pps);
         }
         if (playhead >= start && playhead <= start + duration) {
           const slot = this.flashes.size;
@@ -595,18 +605,21 @@ export class PianoRollRenderer {
           this.litKeys[pitch] = t;
           continue;
         }
-        this.noteBuckets[track.bucket[i]!]!.push(drawX, y, drawW, noteHeight);
+        this.noteBuckets[noteBufferIndex(level, track.bucket[i]!)]!.push(drawX, y, drawW, noteHeight);
       }
 
       // Glow pass: every bucket under one faint fill, inflated.
       ctx.fillStyle = this.shade(track.color, 0.1);
       for (const buffer of this.noteBuckets) buffer.fillInto(ctx, GLOW_SPREAD);
-      // Core pass, brighter with velocity.
-      for (let bucket = 0; bucket < VELOCITY_BUCKETS; bucket += 1) {
-        const buffer = this.noteBuckets[bucket]!;
-        if (buffer.size === 0) continue;
-        ctx.fillStyle = this.shade(track.color, 0.4 + (bucket / (VELOCITY_BUCKETS - 1)) * 0.55);
-        buffer.fillInto(ctx);
+      // Core pass, brighter with velocity, dimmed by the volume automation.
+      for (let level = 1; level <= LEVEL_STEPS; level += 1) {
+        for (let bucket = 0; bucket < VELOCITY_BUCKETS; bucket += 1) {
+          const buffer = this.noteBuckets[noteBufferIndex(level, bucket)]!;
+          if (buffer.size === 0) continue;
+          const velocityAlpha = 0.4 + (bucket / (VELOCITY_BUCKETS - 1)) * 0.55;
+          ctx.fillStyle = this.shade(track.color, velocityAlpha * (level / LEVEL_STEPS));
+          buffer.fillInto(ctx);
+        }
       }
     }
   }
@@ -667,7 +680,11 @@ export class PianoRollRenderer {
       const rowTop = this.pitchY[pitch]!;
       const centre = rowTop + this.rowHeight / 2;
       const sounding = playhead >= start && playhead <= start + duration;
-      const strength = track.bucket[i]! / (VELOCITY_BUCKETS - 1);
+      const level = track.level[i]!;
+      if (level === 0) continue; // automated to silence
+      const velocity = track.bucket[i]! / (VELOCITY_BUCKETS - 1);
+      const loudness = level / LEVEL_STEPS;
+      const strength = velocity * loudness;
       if (this.emitting && start > this.emitFrom && start <= playhead) {
         this.particles.emit(toX(playhead), centre, t, strength, pps);
       }
@@ -686,7 +703,7 @@ export class PianoRollRenderer {
           region.reversed, (region.endSeconds - region.startSeconds) * noteRate,
         )
         : 0;
-      this.applyFades(region, count, left, 1, regionX, spp);
+      this.applyGain(region, track.volume, count, left, 1, regionX, spp);
       if (count > 0) {
         const scale = amplitude * this.waveGain(pyramid!);
         const last = Math.min(right, left + count - 1);
@@ -703,7 +720,7 @@ export class PianoRollRenderer {
         ctx.closePath();
         ctx.strokeStyle = this.shade(track.color, sounding ? 0.3 : 0.12);
         ctx.stroke();
-        ctx.fillStyle = this.shade(track.color, sounding ? 1 : Math.round((0.45 + strength * 0.5) * 20) / 20);
+        ctx.fillStyle = this.shade(track.color, sounding ? 1 : Math.round((0.45 + velocity * 0.5) * loudness * 20) / 20);
         ctx.fill();
       }
 

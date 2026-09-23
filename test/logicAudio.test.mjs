@@ -258,10 +258,12 @@ test('placement joins units to definitions on regionRef == oid', () => {
     flex: false,
     reversed: false,
     muted: false,
+    transpose: 0,
     fadeInMs: 0,
     fadeOutMs: 0,
     fadeInCurve: 0,
     fadeOutCurve: 0,
+    timelineTicks: null,
   });
   assert.equal(placed[1].name, 'bass');
 });

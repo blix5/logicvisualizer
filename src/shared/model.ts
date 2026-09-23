@@ -2,6 +2,7 @@
 // clone across IPC: no Buffer, no class instances, no functions. Typed arrays
 // are fine and are used for note data. Nothing here may import node: or electron.
 import type { TempoEvent, TimeSignature } from './timebase';
+import type { VolumeCurve } from './automation';
 
 export type TrackKind = 'midi' | 'audio' | 'unknown';
 
@@ -16,6 +17,8 @@ export type TrackModel = {
   trackRef: number;
   /** Track mute, read from its mixer channel. */
   muted: boolean;
+  /** Volume automation, or null when the track has none. */
+  volume: VolumeCurve | null;
 };
 
 type RegionBase = {
@@ -28,6 +31,8 @@ type RegionBase = {
   endSeconds: number;
   /** Region mute (not track mute): the region is on the timeline but silent. */
   muted: boolean;
+  /** Region Transpose in semitones, from the region inspector. 0 when untouched. */
+  transposeSemitones: number;
 };
 
 /** 4 ints per note: [startTicksRelativeToRegion, durationTicks, pitch, velocity]. */
@@ -39,6 +44,7 @@ export function noteVelocity(n: Int32Array, i: number): number { return n[i * NO
 
 export type MidiRegionModel = RegionBase & {
   kind: 'midi';
+  /** Pitches here are what Logic SOUNDS: the region's transpose is already applied. */
   notes: Int32Array;
   noteCount: number;
   pitchMin: number;
@@ -82,6 +88,16 @@ export type AudioRegionModel = RegionBase & {
 };
 
 export type RegionModel = MidiRegionModel | AudioRegionModel;
+
+/**
+ * The name Logic shows on a region: a transposed MIDI region reads
+ * "Deluxe Classic (-7)" (re_probe15's WindowImage), so this does too.
+ */
+export function regionLabel(region: RegionModel): string {
+  const t = region.transposeSemitones;
+  if (region.kind !== 'midi' || t === 0) return region.name;
+  return `${region.name} (${t > 0 ? '+' : ''}${t})`;
+}
 
 export type AudioFileModel = {
   id: string;

@@ -9,6 +9,7 @@ import { readLogicImage } from '../logic/logicImage';
 import { readPlistJson } from '../logic/logicPlist';
 import { parseMidiRegions } from '../logic/midiRegions';
 import { parseAudioFiles, placedAudioRegions } from '../logic/logicAudio';
+import { parseTrackVolumeAutomation } from '../logic/logicAutomation';
 import {
   resolveTrackNamesByRef,
   resolveTrackChannelNamesByRef,
@@ -151,6 +152,7 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
       colorSource: 'fallback',
       trackRef: strip.ref,
       muted: channelsByRef.get(strip.refKey)?.muted ?? false,
+      volume: null,
     });
   }
   tracks.sort((a, b) => a.arrangeIndex - b.arrangeIndex);
@@ -171,6 +173,7 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
         colorSource: 'fallback',
         trackRef,
         muted: channelsByRef.get(`0x${trackRef.toString(16)}`)?.muted ?? false,
+        volume: null,
       });
     }
     return id;
@@ -197,12 +200,15 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
     for (let i = 0; i < parsed.notes.length; i += 1) {
       const note = parsed.notes[i];
       if (!note) continue;
+      // Draw what the bounce plays: region Transpose shifts pitch at playback
+      // and leaves the stored notes alone.
+      const pitch = Math.max(0, Math.min(127, note.pitch + parsed.transpose));
       notes[i * NOTE_STRIDE] = note.startTicks;
       notes[i * NOTE_STRIDE + 1] = note.durationTicks;
-      notes[i * NOTE_STRIDE + 2] = note.pitch;
+      notes[i * NOTE_STRIDE + 2] = pitch;
       notes[i * NOTE_STRIDE + 3] = note.velocity;
-      if (note.pitch < pitchMin) pitchMin = note.pitch;
-      if (note.pitch > pitchMax) pitchMax = note.pitch;
+      if (pitch < pitchMin) pitchMin = pitch;
+      if (pitch > pitchMax) pitchMax = pitch;
     }
     const startBeat = parsed.positionTicks / 960;
     const lengthBeats = parsed.lengthTicks / 960;
@@ -219,6 +225,7 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
       noteCount: parsed.notes.length,
       pitchMin: pitchMin <= pitchMax ? pitchMin : 60,
       pitchMax: pitchMax >= pitchMin ? pitchMax : 72,
+      transposeSemitones: parsed.transpose,
       muted: parsed.muted,
     };
     regions.push(region);
@@ -258,9 +265,9 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
   // drew a waveform from a file of a different length, which ran out partway.
   const placed = placedAudioRegions(buffer, maxTrackNumber);
 
-  // Flex regions are stretched to follow project tempo, and the stretched length
-  // is NOT stored in the project (see fileTempo.ts). It is recovered from the
-  // audio file's own tempo, read once per file.
+  // Flex regions are stretched to follow project tempo. Their stretched length is
+  // stored in a time map after the placement (flexTimelineTicks); for the few
+  // without one it is estimated from the audio file's own tempo, read once per file.
   const absolutePathByFileId = new Map(audioFiles.map((file) => [file.id, file.absolutePath]));
   const tempoByFileId = new Map<string, number | null>();
   function fileTempo(fileId: string | null): number | null {
@@ -284,16 +291,17 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
     const audioFileId = audioFileIdByOid.get(region.fileOid) ?? null;
     const nativeSeconds = region.lengthSamples / sampleRate;
 
-    // Unstretched: the timeline length IS the audio length. Flexed: the audio
-    // holds a whole number of beats, which play at project tempo, so the
-    // timeline length comes from the tempo map and the audio is squeezed or
-    // stretched to fit. A flex region whose file declares no tempo stays at its
-    // native length -- Logic cannot stretch audio it has no tempo for either.
+    // Unstretched: the timeline length IS the audio length. Flexed: Logic's own
+    // time map gives the length in ticks, and the audio is squeezed or
+    // stretched to fit. Without one, the audio is taken to hold a whole number
+    // of beats at its file's tempo; with no file tempo either, it stays native.
     let endSecondsForRegion = startSeconds + nativeSeconds;
     let sourceRate = 1;
     if (region.flex) {
-      const tempo = fileTempo(audioFileId);
-      const beats = tempo !== null ? flexedBeats(nativeSeconds, tempo) : null;
+      const tempo = region.timelineTicks === null ? fileTempo(audioFileId) : null;
+      const beats = region.timelineTicks !== null
+        ? region.timelineTicks / LOGIC_PPQ
+        : tempo !== null ? flexedBeats(nativeSeconds, tempo) : null;
       if (beats !== null) {
         endSecondsForRegion = beatsToSeconds(tempoMap, startBeat + beats);
         const timelineSeconds = endSecondsForRegion - startSeconds;
@@ -325,6 +333,7 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
       gainDb: region.gainDb,
       flex: region.flex,
       reversed: region.reversed,
+      transposeSemitones: region.transpose,
       muted: region.muted,
       // A fade cannot outlast its region; the dozen in the corpus that claim
       // to are clamped rather than trusted.
@@ -341,6 +350,24 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
       `Flex: ${stretchedCount} stretched`
       + (flexUnresolved > 0 ? `, ${flexUnresolved} at native length (no file tempo)` : ''),
     );
+  }
+
+  // ---- volume automation -------------------------------------------------
+  try {
+    const volumeByRef = parseTrackVolumeAutomation(buffer);
+    for (const track of tracks) {
+      const points = volumeByRef.get(track.trackRef);
+      if (!points || points.length === 0) continue;
+      const seconds = new Float64Array(points.length);
+      const fader = new Float32Array(points.length);
+      points.forEach((point, i) => {
+        seconds[i] = beatsToSeconds(tempoMap, point.positionTicks / LOGIC_PPQ);
+        fader[i] = point.value;
+      });
+      track.volume = { seconds, fader };
+    }
+  } catch (error) {
+    warnings.push(`Volume automation unreadable: ${(error as Error).message}`);
   }
 
   // ---- markers -----------------------------------------------------------

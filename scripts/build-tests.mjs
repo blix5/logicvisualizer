@@ -5,6 +5,8 @@ import { build } from 'esbuild';
 await build({
   entryPoints: {
     timebase: 'src/shared/timebase.ts',
+    model: 'src/shared/model.ts',
+    automation: 'src/shared/automation.ts',
     logicAudio: 'src/main/logic/logicAudio.ts',
     logicAutomation: 'src/main/logic/logicAutomation.ts',
     midiRegions: 'src/main/logic/midiRegions.ts',

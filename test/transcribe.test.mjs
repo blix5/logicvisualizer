@@ -109,6 +109,16 @@ test('kicks and hats land as unpitched hits at their fixed band pitches', () => 
     'a kick smeared into a pitched bass note');
 });
 
+test('one-shot samples that hit at time zero, shorter than a pitch window, still land as hits', () => {
+  const kick = notes(transcribe([drumLoop(0.25, [0], [])], RATE));
+  assert.ok(kick.some((n) => n.unpitched && n.pitch === UNPITCHED_PITCH.low && n.start < 0.02), `no kick: ${JSON.stringify(kick)}`);
+  const hat = notes(transcribe([drumLoop(0.11, [], [0])], RATE));
+  assert.ok(hat.some((n) => n.unpitched && n.pitch === UNPITCHED_PITCH.high && n.start < 0.02), `no hat: ${JSON.stringify(hat)}`);
+  // A one-shot's broadband attack trips several bands; it is still one hit.
+  assert.equal(kick.filter((n) => n.unpitched).length, 1, `kick doubled: ${JSON.stringify(kick)}`);
+  assert.equal(hat.filter((n) => n.unpitched).length, 1, `hat doubled: ${JSON.stringify(hat)}`);
+});
+
 test('a bass note starting after silence is pitched, not a kick', () => {
   const data = new Float32Array(RATE * 2);
   const bass = tone(1.5, [{ pitch: 45, amp: 0.5 }]);

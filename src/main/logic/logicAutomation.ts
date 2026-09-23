@@ -30,6 +30,8 @@
 // a range check, which is exactly the trap an earlier attempt fell into. The
 // give-away is that the top byte falls linearly: 0x5a, 0x53, 0x4d, 0x47 ...
 import { LOGIC_BAR1_TICK_ORIGIN } from '../../shared/timebase';
+import { FADER_UNITY } from '../../shared/automation';
+import { scanRegionCells } from './ops/regionCells';
 
 const QSVE_TAG = 'qSvE';
 const QSVE_BLOCK_LENGTH_OFFSET = 28;
@@ -38,14 +40,19 @@ const QSVE_FIRST_RECORD_OFFSET = 36;
 
 const RECORD_SIZE = 16;
 const RECORD_MARKER = 0x0050;
+// Float-valued records share the chunk: 0x0051 with a float32 at +8 (0.866 in
+// bassthing), most likely plugin-parameter automation. Not decoded; skipped.
+const FLOAT_RECORD_MARKER = 0x0051;
+// Bytes +2..3: a fraction of a tick (/ 65536), as on arrangement placements.
+const SUBTICK_OFFSET = 2;
+const SUBTICK_SCALE = 65536;
 const POSITION_OFFSET = 4;
 const VALUE_OFFSET = 8;
 const PARAMETER_OFFSET = 12;
 /** The value is 8.24 fixed point. */
 const VALUE_SCALE = 1 << 24;
 
-/** Logic's fader reading for unity gain. */
-export const FADER_UNITY = 90;
+export { FADER_UNITY };
 /** Pan is 0..127 with this as centre; 0 is hard left, 127 hard right. */
 export const PAN_CENTRE = 64;
 
@@ -71,6 +78,11 @@ export type AutomationLane = {
   /** Low byte of the record's +12 field; 7 is volume, 0x0a is pan. */
   parameterId: number;
   points: AutomationPoint[];
+  /**
+   * The track the lane belongs to, or null when unattributed. See
+   * attributeAutomationLanes().
+   */
+  trackRef: number | null;
 };
 
 function findAllTags(buffer: Buffer, tag: string): number[] {
@@ -101,10 +113,21 @@ export function parseAutomationLanes(buffer: Buffer): AutomationLane[] {
     const byParameter = new Map<number, AutomationPoint[]>();
     let valid = true;
     let previousTick = -1;
+    let pointCount = 0;
     for (let i = 0; i < count; i += 1) {
       const at = first + i * RECORD_SIZE;
-      if (buffer.readUInt16LE(at) !== RECORD_MARKER) { valid = false; break; }
-      const rawTick = buffer.readUInt32LE(at + POSITION_OFFSET);
+      const marker = buffer.readUInt16LE(at);
+      // Logic interleaves other 16-byte rows into a real list, exactly as in
+      // the tempo list: float-valued records, and meta rows whose first six
+      // bytes are zero (a marker such as 0xbb follows). bassthing.logicx's
+      // volume lanes carry both, and rejecting the chunk on them dropped every
+      // lane in the project.
+      if (marker === FLOAT_RECORD_MARKER) continue;
+      if (marker === 0 && buffer.readUInt32LE(at + 2) === 0) continue;
+      if (marker !== RECORD_MARKER) { valid = false; break; }
+      pointCount += 1;
+      const rawTick = buffer.readUInt32LE(at + POSITION_OFFSET)
+        + buffer.readUInt16LE(at + SUBTICK_OFFSET) / SUBTICK_SCALE;
       const value = buffer.readUInt32LE(at + VALUE_OFFSET) / VALUE_SCALE;
       // Automation is written in time order; a list that is not sorted, or that
       // carries an out-of-range value, is some other 16-byte structure.
@@ -118,23 +141,54 @@ export function parseAutomationLanes(buffer: Buffer): AutomationLane[] {
       if (list) list.push(point);
       else byParameter.set(parameterId, [point]);
     }
-    if (!valid) continue;
+    if (!valid || pointCount < MIN_RECORDS) continue;
     for (const [parameterId, points] of byParameter) {
       if (points.length < MIN_RECORDS) continue;
-      lanes.push({ chunkOffset: tagOffset, parameterId, points });
+      lanes.push({ chunkOffset: tagOffset, parameterId, points, trackRef: null });
     }
   }
   return lanes;
 }
 
 /**
- * Fader units to decibels, using the one calibration point the probe gives:
- * 90 is unity. Logic's fader taper is not linear in dB, so this is only exact
- * at unity and at -inf; treat intermediate values as approximate.
+ * Sets each lane's trackRef from the region cell that owns its chunk.
+ *
+ * An automation list is stored as a sequence exactly like a MIDI region: a
+ * region cell named "*Automation" whose qSvE IS the automation chunk, and whose
+ * preamble carries the track ref at qSvE - 111 like any other cell. Every lane
+ * in re_probe9/11 and all eight in arp swell beat sit in such a cell, and the
+ * refs name the tracks you would expect: four of its "Bright Synth Lead" layers
+ * (the arp swells), the 808 bass, a reverb aux, and "guitar feedback thing"
+ * (volume and pan).
+ */
+export function attributeAutomationLanes(buffer: Buffer, lanes: AutomationLane[]): AutomationLane[] {
+  const refByQsve = new Map<number, number>();
+  for (const cell of scanRegionCells(buffer)) refByQsve.set(cell.qsve, cell.trackRef);
+  return lanes.map((lane) => ({ ...lane, trackRef: refByQsve.get(lane.chunkOffset) ?? null }));
+}
+
+/**
+ * Volume automation per track ref, with each lane's points in time order. A
+ * track with more than one volume lane (none seen yet) keeps the longest.
+ */
+export function parseTrackVolumeAutomation(buffer: Buffer): Map<number, AutomationPoint[]> {
+  const byRef = new Map<number, AutomationPoint[]>();
+  for (const lane of attributeAutomationLanes(buffer, parseAutomationLanes(buffer))) {
+    if (lane.parameterId !== AUTOMATION_PARAM_VOLUME || lane.trackRef === null) continue;
+    const existing = byRef.get(lane.trackRef);
+    if (!existing || lane.points.length > existing.length) byRef.set(lane.trackRef, lane.points);
+  }
+  return byRef;
+}
+
+/**
+ * Fader units to decibels by the MIDI volume law, 40·log10(v/90): exact at
+ * unity (90) and -inf (0), and it reproduces the fader's +6 dB ceiling at 127.
+ * Confirmed at a third point: bassthing's Aux 3 stores 58.8, which Logic shows as -7.4 dB.
  */
 export function faderToDecibels(fader: number): number {
   if (fader <= 0) return -Infinity;
-  return 20 * Math.log10(fader / FADER_UNITY);
+  return 40 * Math.log10(fader / FADER_UNITY);
 }
 
 /** Pan units to Logic's -64..+63 display scale. */

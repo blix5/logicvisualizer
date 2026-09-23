@@ -122,7 +122,24 @@ const UNIT_MUTE_BIT = 0x01;
  * fade-in and 3,237 a fade-out, and all but 12 fit inside their region; the
  * commonest value is Logic's 17 ms anti-click fade-out.
  */
+// i8 semitones: the region inspector's Transpose. re_probe15 set region 1 to
+// +5 and it reads 0x05 here; its MIDI copy at -7 reads 0xf9 at the same offset
+// of a MIDI placement, so the slot is shared by both kinds.
+const UNIT_TRANSPOSE_OFFSET = 53;
 const UNIT_FADE_OUT_MS_OFFSET = 72;
+// After each placement unit Logic writes a run of 80-byte time-map records,
+// tagged 0xaa at +7 with a record type at +6. A type-3 record maps a sample
+// count (+0, i32) to a timeline length in ticks (+12 u32, plus a +10 u16
+// fraction / 65536). The one whose samples equal the region's length is where
+// the region's last sample lands: its timeline length. See flexTimelineTicks.
+const TIME_MAP_TAG_OFFSET = 7;
+const TIME_MAP_TAG = 0xaa;
+const TIME_MAP_TYPE_OFFSET = 6;
+const TIME_MAP_END_ANCHOR = 3;
+const TIME_MAP_TICKS_OFFSET = 12;
+const TIME_MAP_TICK_FRACTION_OFFSET = 10;
+/** A run this long is not a time map; stop rather than walk the file. */
+const MAX_TIME_MAP_RECORDS = 5000;
 const UNIT_FADE_OUT_CURVE_OFFSET = 75;
 const UNIT_FADE_IN_MS_OFFSET = 76;
 const UNIT_FADE_IN_CURVE_OFFSET = 79;
@@ -163,6 +180,8 @@ export type LogicAudioRegion = {
 };
 
 export type LogicArrangeUnit = {
+  /** Byte offset of the unit; its time map follows it. */
+  offset: number;
   /** Ticks from bar 1 (the ARRANGE_TICK_ORIGIN has already been removed). */
   positionTicks: number;
   trackRef: number;
@@ -178,6 +197,8 @@ export type LogicArrangeUnit = {
   /** Reverse on: the region plays back-to-front. */
   reversed: boolean;
   muted: boolean;
+  /** Region Transpose in semitones. */
+  transpose: number;
   fadeInMs: number;
   fadeOutMs: number;
   /** -99..99, 0 linear; see UNIT_FADE_IN_CURVE_OFFSET. */
@@ -278,6 +299,7 @@ export function parseArrangeUnits(buffer: Buffer, maxTrackNumber = MAX_TRACK_NUM
     if (trackNumber < 1 || trackNumber > maxTrackNumber) continue;
 
     units.push({
+      offset: at,
       positionTicks: rawPosition - ARRANGE_TICK_ORIGIN
         + buffer.readUInt16LE(at + UNIT_SUBTICK_OFFSET) / SUBTICK_SCALE,
       trackRef: buffer.readUInt32LE(at + UNIT_TRACK_REF_OFFSET),
@@ -288,6 +310,7 @@ export function parseArrangeUnits(buffer: Buffer, maxTrackNumber = MAX_TRACK_NUM
       flex: (buffer.readUInt8(at + UNIT_FLAGS_OFFSET) & UNIT_FLEX_BIT) !== 0,
       reversed: (buffer.readUInt8(at + UNIT_FLAGS_OFFSET) & UNIT_REVERSE_BIT) !== 0,
       muted: (buffer.readUInt8(at + UNIT_MUTE_OFFSET) & UNIT_MUTE_BIT) !== 0,
+      transpose: buffer.readInt8(at + UNIT_TRANSPOSE_OFFSET),
       fadeInMs: buffer.readUInt16LE(at + UNIT_FADE_IN_MS_OFFSET),
       fadeOutMs: buffer.readUInt16LE(at + UNIT_FADE_OUT_MS_OFFSET),
       fadeInCurve: buffer.readInt8(at + UNIT_FADE_IN_CURVE_OFFSET),
@@ -313,11 +336,50 @@ export type PlacedAudioRegion = {
   /** Reverse on: the region plays back-to-front. */
   reversed: boolean;
   muted: boolean;
+  /** Region Transpose in semitones. */
+  transpose: number;
   fadeInMs: number;
   fadeOutMs: number;
   fadeInCurve: number;
   fadeOutCurve: number;
+  /**
+   * Timeline length in ticks from the placement's time map, or null when it has
+   * none. Only meaningful for a flexed region; see flexTimelineTicks.
+   */
+  timelineTicks: number | null;
 };
+
+/**
+ * The timeline length Logic stored for a placed region, in ticks, from the
+ * time map that follows its placement unit.
+ *
+ * This is how a Flex region's stretched length is stored after all. The run
+ * after bassthing's first "guitar thingy scream" region ends in a type-3 record
+ * mapping 382999 samples -- exactly its length -- to 20160 ticks, 21 beats,
+ * which lands it on bar 16.5 where Logic draws it and where its split-off
+ * sibling starts. Its file has no tempo label, so the file-tempo estimate left
+ * it at native length and short by 0.7 bar.
+ *
+ * Across ~/Music/Logic 5,142 of 5,318 flex-on placements have such a record.
+ * Where it disagrees with the file-tempo estimate (739 placements), the estimate
+ * overlaps the next region on the lane 142 times and the anchor once, and the
+ * anchor abuts the next region exactly more often (113 vs 88).
+ */
+export function flexTimelineTicks(buffer: Buffer, unitOffset: number, lengthSamples: number): number | null {
+  for (
+    let at = unitOffset + UNIT_SIZE, count = 0;
+    at + UNIT_SIZE <= buffer.length && count < MAX_TIME_MAP_RECORDS;
+    at += UNIT_SIZE, count += 1
+  ) {
+    if (buffer.readUInt8(at + TIME_MAP_TAG_OFFSET) !== TIME_MAP_TAG) break;
+    if (buffer.readUInt8(at + TIME_MAP_TYPE_OFFSET) !== TIME_MAP_END_ANCHOR) continue;
+    if (buffer.readInt32LE(at) !== lengthSamples) continue;
+    const ticks = buffer.readUInt32LE(at + TIME_MAP_TICKS_OFFSET)
+      + buffer.readUInt16LE(at + TIME_MAP_TICK_FRACTION_OFFSET) / 65536;
+    return ticks > 0 ? ticks : null;
+  }
+  return null;
+}
 
 /**
  * Joins arrangement units to region definitions on BOTH `regionRef == oid` and
@@ -359,6 +421,8 @@ export function placedAudioRegions(buffer: Buffer, maxTrackNumber?: number): Pla
       // unit (+15 bit 0, re_probe12) and the region definition (AuRg +41 bit 1,
       // Logic Pro 11's djpubichair). Either marks the region muted.
       muted: unit.muted || region.muted,
+      transpose: unit.transpose,
+      timelineTicks: unit.flex ? flexTimelineTicks(buffer, unit.offset, region.lengthSamples) : null,
       fadeInMs: unit.fadeInMs,
       fadeOutMs: unit.fadeOutMs,
       fadeInCurve: unit.fadeInCurve,

@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { buildProjectModel } from '../.test-build/buildProject.mjs';
+import { regionLabel } from '../.test-build/model.mjs';
 import { buildTempoMap, secondsToBeats } from '../.test-build/timebase.mjs';
 
 // Gated on an env var with a sensible default rather than a hardcoded absolute
@@ -186,4 +187,77 @@ test('region mute and fades decode from the probes that isolate them', {
   assert.ok(audio[0].fadeInCurve > 0.9 && audio[2].fadeOutCurve > 0.9);
   const midi = model.regions.filter((r) => r.kind === 'midi');
   assert.deepEqual(midi.map((r) => [Math.round(r.startSeconds), r.muted]), [[8, false], [24, true]]);
+});
+
+test('region transpose decodes from the placement, for MIDI and audio', {
+  skip: !fs.existsSync(probe('re_probe15')) && 're_probe15 not found',
+}, () => {
+  // re_probe15: re_probe5 with audio region 1 at +5 (Flex on), plus a MIDI
+  // region at bar 1 and a -7 copy at bar 11. Logic labels it "Deluxe Classic (-7)".
+  const model = buildProjectModel(probe('re_probe15'));
+  const audio = model.regions.filter((r) => r.kind === 'audio');
+  assert.deepEqual(audio.map((r) => r.transposeSemitones), [5, 0, 0]);
+  const midi = model.regions.filter((r) => r.kind === 'midi');
+  assert.deepEqual(midi.map((r) => [Math.round(r.startSeconds), r.transposeSemitones, r.muted]), [[0, 0, false], [20, -7, false]]);
+  assert.deepEqual(midi.map(regionLabel), ['Deluxe Classic', 'Deluxe Classic (-7)']);
+  // The copy's notes sound 7 semitones lower; the stored block is identical.
+  const pitches = (r) => Array.from({ length: r.noteCount }, (_, i) => r.notes[i * 4 + 2]);
+  assert.deepEqual(pitches(midi[1]), pitches(midi[0]).map((p) => p - 7));
+});
+
+test('volume automation lands on the track that owns it', {
+  skip: !fs.existsSync(probe('re_probe9')) && 're_probe9 not found',
+}, () => {
+  // re_probe9's one edit is a volume ramp, 0 dB at bar 1 to -inf at bar 21, on
+  // a single track; 120 BPM puts bar 21 at 40 s.
+  const model = buildProjectModel(probe('re_probe9'));
+  const automated = model.tracks.filter((t) => t.volume);
+  assert.equal(automated.length, 1, 'exactly one track carries it');
+  const { seconds, fader } = automated[0].volume;
+  assert.equal(fader[0], 90);
+  assert.equal(fader[fader.length - 1], 0);
+  assert.ok(Math.abs(seconds[seconds.length - 1] - 40) < 0.1, `ends at 40 s (${seconds[seconds.length - 1]})`);
+  assert.ok(model.regions.some((r) => r.trackId === automated[0].id), 'the automated track has regions');
+});
+
+test('a flexed region takes its stretched length from the placement time map', {
+  skip: !fs.existsSync(path.join(root, 'bassthing.logicx')) && 'bassthing.logicx not found',
+}, () => {
+  // "guitar thingy scream": one flexed take split in two. Logic draws the first
+  // from bar 11.25 to 16.5, touching the second. Its file has no tempo label,
+  // so only the stored time map (382999 samples -> 20160 ticks) gets this right.
+  const model = buildProjectModel(path.join(root, 'bassthing.logicx'));
+  const guitar = model.regions
+    .filter((r) => r.kind === 'audio' && r.name.startsWith('freesound_community-guitar-feedback-25606_1.'))
+    .sort((a, b) => a.startBeat - b.startBeat);
+  const bar = (beat) => beat / 4 + 1;
+  assert.equal(bar(guitar[0].startBeat), 11.25);
+  assert.equal(bar(guitar[0].startBeat + guitar[0].lengthBeats), 16.5);
+  assert.equal(bar(guitar[1].startBeat), 16.5, 'the second half starts where the first ends');
+  assert.ok(guitar[0].sourceRate < 1, 'the audio is stretched to fill it');
+});
+
+test('volume lanes interleaved with other rows still decode', {
+  skip: !fs.existsSync(path.join(root, 'bassthing.logicx')) && 'bassthing.logicx not found',
+}, () => {
+  // "guitar thingy scream" is drawn in Logic as 0 dB at 16 3 1 0, -inf by
+  // 16 3 1 18, held to 16 3 2 196, easing back to 0 dB at bar 17. Its chunk
+  // interleaves float records and meta rows, which used to reject it outright.
+  const model = buildProjectModel(path.join(root, 'bassthing.logicx'));
+  const guitar = model.tracks.find((t) => t.name === 'guitar thingy scream');
+  assert.ok(guitar?.volume, 'the track has its volume lane');
+  const at = (bar, beat, sixteenth, tick) => {
+    const beats = (bar - 1) * 4 + (beat - 1) + (sixteenth - 1) / 4 + tick / 960;
+    return beats * 60 / model.baseBpm;
+  };
+  const faderAt = (seconds) => {
+    const { seconds: t, fader } = guitar.volume;
+    let i = 0;
+    while (i + 1 < t.length && t[i + 1] <= seconds) i += 1;
+    return fader[i];
+  };
+  assert.equal(faderAt(at(16, 3, 1, 0)), 90, '0 dB where the dip starts');
+  assert.equal(faderAt(at(16, 3, 2, 100)), 0, '-inf through the hold');
+  assert.ok(faderAt(at(16, 4, 3, 0)) > 20 && faderAt(at(16, 4, 3, 0)) < 90, 'easing back up');
+  assert.equal(faderAt(at(17, 1, 1, 10)), 90, 'back to 0 dB at bar 17');
 });

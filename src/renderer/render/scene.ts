@@ -16,9 +16,30 @@ import {
   type RegionModel,
 } from '../../shared/model';
 import { LOGIC_PPQ } from '../../shared/timebase';
+import { volumeLevel, type VolumeCurve } from '../../shared/automation';
 
 /** Velocity is quantised so the renderer can batch notes by fill colour. */
 export const VELOCITY_BUCKETS = 8;
+
+/**
+ * Track volume automation at a note's start, quantised the same way: 0 is
+ * silent (the note is not drawn), LEVEL_STEPS is unity or louder. A note's
+ * opacity is its velocity's alpha times level / LEVEL_STEPS.
+ */
+export const LEVEL_STEPS = 8;
+
+/** The automation level step for a note starting at `seconds`. */
+export function levelStep(curve: VolumeCurve | null, seconds: number): number {
+  return Math.round(volumeLevel(curve, seconds) * LEVEL_STEPS);
+}
+
+/** Index of a (level, velocity bucket) pair among the renderer's note buffers. Level must be >= 1. */
+export function noteBufferIndex(level: number, bucket: number): number {
+  return (level - 1) * VELOCITY_BUCKETS + bucket;
+}
+
+/** How many note buffers noteBufferIndex addresses. */
+export const NOTE_BUFFER_COUNT = LEVEL_STEPS * VELOCITY_BUCKETS;
 
 /** Floats per note in `NoteBatch.data`: start, duration, y offset from lane top. */
 export const NOTE_FIELDS = 3;
@@ -28,6 +49,8 @@ export type NoteBatch = {
   data: Float32Array;
   /** Velocity bucket, 0..VELOCITY_BUCKETS-1, parallel to `data`. */
   buckets: Uint8Array;
+  /** Automation level step, 0..LEVEL_STEPS, parallel to `data`. */
+  levels: Uint8Array;
   count: number;
   /** Longest note here, so a start-sorted search knows how far to back off. */
   maxDurationSeconds: number;
@@ -47,6 +70,8 @@ export type LaneLayout = {
   color: string;
   /** Track mute: every region on the lane draws as muted. */
   muted: boolean;
+  /** Track volume automation; scales waveforms. Already baked into note levels. */
+  volume: VolumeCurve | null;
   top: number;
   height: number;
   /** Regions on this lane, sorted by startSeconds, for binary-search culling. */
@@ -73,7 +98,7 @@ export type LaneLayoutConfig = {
  * sort has to happen somewhere — doing it here means the frame loop can binary
  * search into a region instead of scanning all of its notes.
  */
-function buildNoteBatch(region: MidiRegionModel, laneHeight: number): NoteBatch | null {
+function buildNoteBatch(region: MidiRegionModel, laneHeight: number, volume: VolumeCurve | null): NoteBatch | null {
   const count = Math.floor(region.notes.length / NOTE_STRIDE);
   if (count === 0) return null;
 
@@ -95,6 +120,7 @@ function buildNoteBatch(region: MidiRegionModel, laneHeight: number): NoteBatch 
 
   const data = new Float32Array(count * NOTE_FIELDS);
   const buckets = new Uint8Array(count);
+  const levels = new Uint8Array(count);
   let maxDurationSeconds = 0;
 
   for (let slot = 0; slot < count; slot += 1) {
@@ -112,10 +138,11 @@ function buildNoteBatch(region: MidiRegionModel, laneHeight: number): NoteBatch 
       VELOCITY_BUCKETS - 1,
       Math.floor((noteVelocity(region.notes, i) / 127) * VELOCITY_BUCKETS),
     );
+    levels[slot] = levelStep(volume, startSeconds);
     if (durSeconds > maxDurationSeconds) maxDurationSeconds = durSeconds;
   }
 
-  return { data, buckets, count, maxDurationSeconds, noteHeight };
+  return { data, buckets, levels, count, maxDurationSeconds, noteHeight };
 }
 
 export function buildScene(model: ProjectModel, config: LaneLayoutConfig): Scene {
@@ -141,7 +168,7 @@ export function buildScene(model: ProjectModel, config: LaneLayoutConfig): Scene
       if (duration > maxRegionDurationSeconds) maxRegionDurationSeconds = duration;
       return {
         region,
-        notes: region.kind === 'midi' ? buildNoteBatch(region, config.laneHeight) : null,
+        notes: region.kind === 'midi' ? buildNoteBatch(region, config.laneHeight, track.volume ?? null) : null,
       };
     });
     lanes.push({
@@ -149,6 +176,7 @@ export function buildScene(model: ProjectModel, config: LaneLayoutConfig): Scene
       name: track.name,
       color: track.color,
       muted: track.muted,
+      volume: track.volume ?? null,
       top,
       height: config.laneHeight,
       regions,

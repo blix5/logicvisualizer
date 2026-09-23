@@ -130,3 +130,16 @@ test('muted regions are left out of the roll, MIDI and audio alike', () => {
   assert.deepEqual(scene.tracks.map((t) => [t.trackId, t.count]), [['a', 1]]);
   assert.equal(scene.audio.length, 0);
 });
+
+test('volume automation dims notes and silences them at -inf', () => {
+  // Unity until 2 s, then a straight ramp to -inf at 4 s.
+  const volume = { seconds: new Float64Array([0, 2, 4]), fader: new Float32Array([90, 90, 0]) };
+  const scene = buildRollScene(project([{ ...track('a', 0), volume }], [
+    midi('r1', 'a', 0, [[0, PPQ, 60, 100]]),
+    midi('r2', 'a', 2, [[PPQ * 2, PPQ, 62, 100], [PPQ * 4, PPQ, 64, 100]]),
+  ]));
+  // At 0 s unity, at 3 s halfway down, at 4 s silent.
+  assert.deepEqual(Array.from(scene.tracks[0].level), [8, 4, 0]);
+  const unautomated = buildRollScene(project([track('a', 0)], [midi('r1', 'a', 0, [[0, PPQ, 60, 100]])]));
+  assert.deepEqual(Array.from(unautomated.tracks[0].level), [8]);
+});

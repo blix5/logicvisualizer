@@ -247,7 +247,7 @@ Three probes, all built on re_probe5 (three audio regions on one track, 120 BPM)
 |---|---|---|
 | 12 | region 2 muted | its unit `+15`: `0x00` → `0x81` |
 | 13 | 1-bar fade-in on region 1, 3-bar fade-out on region 3 | unit `+76` u16 = 1999, unit `+72` u16 = 5995 |
-| 14 | those fades set to ease in / ease out; a MIDI track with a region at bar 5 and an identical **muted** copy at bar 13 | `+79` = 98, `+75` = 99; the muted MIDI unit has `+8` = 0 |
+| 14 | those fades set to ease in / ease out; a MIDI track with a region at bar 5 and an identical **muted** copy at bar 13 | `+79` = 98, `+75` = 99; the muted MIDI unit has `+8` = 0 (a red herring, see Region transpose) |
 
 **Audio mute is `+15` bit 0.** Bit 7 of the same byte is set on a merely
 *selected* region (re_probe13 reads `0x80` there), so test the bit, not the
@@ -261,7 +261,7 @@ three bars at 120 BPM. Across the corpus 2,223 placements have a fade-in and
 commonest value is a 17 ms fade-out — Logic's anti-click fade. Logic's exact
 curve taper is not decoded; the renderer uses a power curve of the same shape.
 
-**MIDI mute clears `+8` and keeps `+32`.** The parser used to require the two
+**MIDI mute clears `+8` and keeps `+32`.** *(Withdrawn: re_probe15 shows an unmuted copy with `+8` cleared; see Region transpose. Kept for the record.)* The parser used to require the two
 refs to agree, so it silently **dropped every muted MIDI region** (26 across the
 corpus, re_probe14's included). A per-track record at bar 1 has the same shape
 (`+8` = 0, `+32` set), but its `+32` names no region cell, so the cell join
@@ -291,6 +291,54 @@ The reversed copies also carried a clip gain and a fade the forward ones lacked,
 but those co-vary only because the owner mixed the reverse-swells that way; they
 are not part of the reverse encoding. Reverse is decoded but has no bearing on a
 region's position or length — only the renderer mirrors the waveform.
+
+### Flex, take two — the stretched length IS stored
+
+The claim above that the stretched length is not in the project is wrong. After
+each audio placement unit Logic writes a run of 80-byte **time-map records**,
+tagged `0xaa` at `+7` with a type at `+6`. A **type-3** record maps a sample
+count (`+0`, i32) to ticks (`+12` u32, plus a `+10` u16 fraction / 65536); the
+one whose samples equal the region's `AuRg +58` length gives the region's
+**timeline length**. Types 6 (flex markers), 0x0b (transients), 1, 7 and others
+also occur, but they are not decoded.
+
+Found through `bassthing.logicx`'s "guitar thingy scream": one flexed take split
+in two, which Logic draws touching at bar 16.5. Its file has no tempo label, so
+the file-tempo estimate left the first half at native length, 0.7 bar short.
+Its time map ends 382999 samples → 20160 ticks = 21 beats, bars 11.25 → 16.5.
+
+Across ~/Music/Logic, 5,142 of 5,318 flex-on placements have a matching type-3
+record. Where it disagrees with the file-tempo estimate (739), the estimate
+overlaps the next region on its lane 142 times and the anchor once, and the
+anchor abuts the next region exactly more often (113 vs 88). The whole-beats
+rounding was the estimate's main error: hi-hat rolls come out 0.500 / 0.625
+beats, not 0.725. The file-tempo path remains only as a fallback.
+
+### Region transpose — solved
+
+**Transpose is placement `+53`, an i8 in semitones, for MIDI and audio
+alike.** re_probe15 is re_probe5 with audio region 1 set to +5 (Flex on), plus a
+MIDI track with a region at bar 1 and a copy at bar 11 set to -7. The audio unit
+reads `0x05` at `+53`, the MIDI copy `0xf9`, and every other placement 0.
+Logic applies it at playback and leaves the stored notes alone, so
+`buildProject` adds it to each MIDI note's pitch and the roll draws what the
+bounce plays. Logic's own label is "Deluxe Classic (-7)"; `regionLabel()` matches it.
+
+**A stale copy in the region cell misled the first attempt.** The cell's
+padded-name-end `+0xa1` also holds transpose-shaped values: 0 on 95% of the
+corpus, otherwise mostly octaves. It agrees with `+53` on about 97% of
+placements, so a corpus hunt picked it. But it reads **0** on re_probe15's -7
+copy, and disagrees on about 60 corpus placements (`12/0`, `0/12`,
+`24/12`, …). It is not read.
+
+**The same probe overturned MIDI "mute = `+8` cleared".** The -7 copy is
+unmuted (the inspector's Mute box is clear in its WindowImage) yet has `+8` = 0.
+re_probe14's muted copy also carries the cell mute flag (`+0x4e` bit 0), and only
+1 of the 27 corpus placements with `+8` cleared has a muted cell. MIDI mute is
+now the cell flag alone; `+8` = 0 is still accepted as a placement, and its
+meaning is unknown.
+
+Track-level transpose (track inspector) is a separate parameter, not decoded.
 
 ### Region mute, take two — the definition carries it in Logic Pro 11
 
@@ -345,8 +393,30 @@ check and fooled an earlier attempt. The tell is that the top byte falls
 linearly: `0x5a, 0x53, 0x4d, 0x47, …`. Any similar hunt should require the values
 to *vary sensibly*, not merely to be finite.
 
-The fader-to-dB taper is only calibrated at two points (90 = 0 dB, 0 = -inf), so
-`faderToDecibels()` is approximate in between.
+**Other rows are interleaved, as in the tempo list.** Real lists carry
+`0x0051` records (a float32 at `+8`, likely plugin-parameter automation, not
+decoded) and meta rows whose first six bytes are zero. Requiring every row to be
+`0x0050` rejected those chunks whole: `bassthing.logicx` lost all five of its
+volume lanes, and across ~/Music/Logic the walk now finds 95 lanes instead of 34
+(69 volume instead of 31), every one attributed to a real track strip. Positions
+also carry a sub-tick fraction at `+2` (u16 / 65536), as on placements.
+bassthing's "guitar thingy scream" decodes to 0 dB at 16 3 1 0, -inf at 16 3 1 18,
+held to 16 3 2 196 and eased back to 0 dB at bar 17, matching its arrange view.
+
+**Each lane belongs to the track named by its sequence's region cell.** An
+automation list is stored like a MIDI region: a cell named `*Automation` whose
+qSvE *is* the automation chunk, with the track ref at qSvE - 111 like any
+other cell (`attributeAutomationLanes()`). All 34 lanes in ~/Music/Logic sit in
+such a cell and resolve to a real track strip, with no track carrying two lanes
+of one parameter. `arp swell beat`'s eight land on four of its "Bright Synth
+Lead" layers (the swells), the 808 bass, a reverb aux, and "guitar feedback
+thing" (volume and pan). Only ids `0x07` and `0x0a` occur, so there is no pitch
+or plugin automation to decode yet.
+
+The fader taper is calibrated only at 90 = 0 dB and 0 = -inf. `faderToDecibels()`
+uses the MIDI volume law, 40·log10(v/90), which fits both and gives the fader's
++6 dB ceiling at 127. It is confirmed at a third point: bassthing's Aux 3 lane
+stores 58.8, and Logic displays it as -7.4 dB, which is what the law gives.
 
 ### Remaining gaps
 
@@ -363,11 +433,6 @@ The fader-to-dB taper is only calibrated at two points (90 = 0 dB, 0 = -inf), so
 - **MIDI start-trim**, if it exists. No region in the corpus has notes starting
   before it, so there is nothing to shift, but a probe that trims a MIDI
   region's START would confirm whether a content offset is stored anywhere.
-- **Which track an automation lane belongs to.** The parameter is known
-  (`0x07` volume, `0x0a` pan) and lanes are separated, but nothing yet ties a
-  lane to its track, so a project with automation on several tracks produces
-  lanes that cannot be attributed. `arp swell beat.logicx` yields 8 lanes with
-  no way to say whose they are.
 - **Plugin-parameter automation.** Only ids `0x07` and `0x0a` have been seen; a
   probe automating a plugin parameter would show whether those ids extend.
 

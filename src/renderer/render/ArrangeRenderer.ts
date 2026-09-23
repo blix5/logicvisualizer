@@ -10,14 +10,18 @@
 //      fillStyle reparses a CSS colour string, which dominated the note loop.
 //   2. Region and note fills are clamped to the viewport plus a margin: a
 //      region is as wide as it is long, which at high zoom is enormous.
-import type { AudioRegionModel, RegionModel } from '../../shared/model';
+import { regionLabel, type AudioRegionModel, type RegionModel } from '../../shared/model';
 import type { BarGridEntry } from '../../shared/timebase';
 import { levelForPixelsPerSecond, peakCount, type PeakPyramid } from './peaks';
 import { fadeGain, hasFade } from './fade';
+import { volumeGain, type VolumeCurve } from '../../shared/automation';
 import { RectBuffer } from './rectBuffer';
 import type { SpectrumMode } from './spectrum';
 import {
   NOTE_FIELDS,
+  LEVEL_STEPS,
+  NOTE_BUFFER_COUNT,
+  noteBufferIndex,
   VELOCITY_BUCKETS,
   firstVisibleIndex,
   firstVisibleNote,
@@ -84,8 +88,9 @@ export class ArrangeRenderer {
   private dpr = 1;
 
   private readonly alphaCache = new Map<string, string>();
+  /** One buffer per (automation level, velocity bucket); see noteBufferIndex. */
   private readonly noteBuckets: RectBuffer[] =
-    Array.from({ length: VELOCITY_BUCKETS }, () => new RectBuffer());
+    Array.from({ length: NOTE_BUFFER_COUNT }, () => new RectBuffer());
   private readonly waveform = new RectBuffer();
   /** Muted regions' notes and waveforms, flushed together in grey. */
   private readonly mutedNotes = new RectBuffer();
@@ -287,7 +292,7 @@ export class ArrangeRenderer {
     if (region.kind === 'audio') {
       const pyramid = region.audioFileId ? view.peaks(region.audioFileId) : null;
       if (pyramid) {
-        this.collectWaveform(pyramid, region, laneTop, lane.height, toX, view, fillX, fillW, muted);
+        this.collectWaveform(pyramid, region, lane.volume, laneTop, lane.height, toX, view, fillX, fillW, muted);
       } else {
         // Peaks not read yet, or no file to read: the centre line keeps the
         // region legible rather than leaving it empty.
@@ -304,6 +309,7 @@ export class ArrangeRenderer {
   private collectWaveform(
     pyramid: PeakPyramid,
     region: AudioRegionModel,
+    volume: VolumeCurve | null,
     laneTop: number,
     laneHeight: number,
     toX: (s: number) => number,
@@ -366,13 +372,16 @@ export class ArrangeRenderer {
         if (bucketHigh > high) high = bucketHigh;
       }
 
-      // Fades taper the waveform the way they taper the sound.
-      const scale = faded
-        ? amplitude * fadeGain(region, region.startSeconds + (x + 0.5 - startX) * secondsPerPixel)
-        : amplitude;
-      const top = centre - (high / 127) * scale;
-      const height = Math.max(1, centre - (low / 127) * scale - top);
-      target.push(x, top, 1, height);
+      // Fades and the track's volume automation taper the waveform the way
+      // they taper the sound. A boost above unity can push a loud file past
+      // the lane, so the column is clipped to it.
+      const seconds = region.startSeconds + (x + 0.5 - startX) * secondsPerPixel;
+      let scale = amplitude;
+      if (faded) scale *= fadeGain(region, seconds);
+      if (volume) scale *= volumeGain(volume, seconds);
+      const top = Math.max(centre - amplitude, centre - (high / 127) * scale);
+      const bottom = Math.min(centre + amplitude, centre - (low / 127) * scale);
+      target.push(x, top, 1, Math.max(1, bottom - top));
     }
   }
 
@@ -393,7 +402,7 @@ export class ArrangeRenderer {
     ctx.beginPath();
     ctx.rect(x + 3, laneTop + 3, w - 6, 12);
     ctx.clip();
-    ctx.fillText(region.name, x + 4, laneTop + 4);
+    ctx.fillText(regionLabel(region), x + 4, laneTop + 4);
     ctx.restore();
   }
 
@@ -427,7 +436,10 @@ export class ArrangeRenderer {
         this.mutedNotes.push(drawX, y, drawW, height);
         continue;
       }
-      this.noteBuckets[batch.buckets[i]!]!.push(drawX, y, drawW, height);
+      // Automated to silence: nothing sounds, so nothing is drawn.
+      const level = batch.levels[i]!;
+      if (level === 0) continue;
+      this.noteBuckets[noteBufferIndex(level, batch.buckets[i]!)]!.push(drawX, y, drawW, height);
     }
   }
 
@@ -443,11 +455,15 @@ export class ArrangeRenderer {
       this.mutedNotes.fillInto(ctx);
     }
 
-    for (let bucket = 0; bucket < VELOCITY_BUCKETS; bucket += 1) {
-      const buffer = this.noteBuckets[bucket]!;
-      if (buffer.size === 0) continue;
-      ctx.fillStyle = this.shade(laneColor, 0.45 + (bucket / (VELOCITY_BUCKETS - 1)) * 0.55);
-      buffer.fillInto(ctx);
+    // Opacity is velocity's alpha scaled by the volume automation's level.
+    for (let level = 1; level <= LEVEL_STEPS; level += 1) {
+      for (let bucket = 0; bucket < VELOCITY_BUCKETS; bucket += 1) {
+        const buffer = this.noteBuckets[noteBufferIndex(level, bucket)]!;
+        if (buffer.size === 0) continue;
+        const velocityAlpha = 0.45 + (bucket / (VELOCITY_BUCKETS - 1)) * 0.55;
+        ctx.fillStyle = this.shade(laneColor, velocityAlpha * (level / LEVEL_STEPS));
+        buffer.fillInto(ctx);
+      }
     }
   }
 

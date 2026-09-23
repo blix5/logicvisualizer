@@ -133,7 +133,9 @@ export function transcribe(channels: Float32Array[], sampleRate: number): Float3
   }
 
   const frames = length >= FFT_SIZE ? Math.floor((length - FFT_SIZE) / HOP) + 1 : 0;
-  if (frames === 0) return new Float32Array(0);
+  // Too short for one pitch window, which a one-shot kick or hat often is:
+  // the hit pass works at 10 ms blocks and can still place it.
+  if (frames === 0) return Float32Array.from(detectHits(channels, sampleRate));
 
   // Pass 1: energy per (frame, pitch) in dB relative to a full-scale sine.
   // Kept whole so pass 2 can judge each frame against the file's loudest.
@@ -270,6 +272,17 @@ type BandName = keyof typeof UNPITCHED_PITCH;
 const BAND_NAMES: BandName[] = ['low', 'mid', 'high'];
 /** A band's hit is leakage if another band is this much louder at the same instant. */
 const DOMINANCE_DB = 15;
+/**
+ * Onsets in different bands this close together are one sound: a single
+ * drum's attack is broadband, so a kick also trips the mid band and a hat's
+ * stick click trips it too. Only the dominant band keeps the hit.
+ */
+const COINCIDENT_BLOCKS = 2;
+/**
+ * Added to each band's peak when picking the dominant one. A hat puts far less
+ * energy above 6 kHz than its click puts into the mid band, yet it is a hat.
+ */
+const BAND_BIAS_DB = [0, 0, 10];
 /** Pitched notes below this, starting around a low hit, are the drum's smear. */
 const SMEAR_MAX_PITCH = 51;
 const SMEAR_MAX_SECONDS = 0.8;
@@ -288,7 +301,7 @@ function detectHits(channels: Float32Array[], sampleRate: number): number[] {
   const frames = channels[0]!.length;
   const block = Math.max(1, Math.round(sampleRate * BLOCK_SECONDS));
   const blocks = Math.floor(frames / block);
-  if (blocks <= ONSET_LOOKBACK) return [];
+  if (blocks === 0) return [];
 
   const low = [new Biquad('lowpass', 150, sampleRate), new Biquad('lowpass', 150, sampleRate)];
   const mid = [new Biquad('highpass', 250, sampleRate), new Biquad('lowpass', 2500, sampleRate)];
@@ -320,10 +333,12 @@ function detectHits(channels: Float32Array[], sampleRate: number): number[] {
     const e = energy[b]!;
     const floor = Math.max(ONSET_FLOOR_DB, bandMax[b]! - ONSET_RANGE_DB);
     let last = -Infinity;
-    for (let k = ONSET_LOOKBACK; k < blocks; k += 1) {
+    // Silence is assumed before the file starts: a one-shot sample's attack is
+    // in its first few milliseconds, with no earlier blocks to rise from.
+    for (let k = 0; k < blocks; k += 1) {
       if (e[k]! < floor || k - last < ONSET_REFRACTORY_BLOCKS) continue;
-      let before = Infinity;
-      for (let j = 1; j <= ONSET_LOOKBACK; j += 1) before = Math.min(before, e[k - j]!);
+      let before = k < ONSET_LOOKBACK ? -Infinity : Infinity;
+      for (let j = 1; j <= Math.min(k, ONSET_LOOKBACK); j += 1) before = Math.min(before, e[k - j]!);
       if (e[k]! - before < ONSET_RISE_DB) continue;
       last = k;
 
@@ -340,10 +355,9 @@ function detectHits(channels: Float32Array[], sampleRate: number): number[] {
     }
   }
 
-  const hits: number[] = [];
   candidates.sort((x, y) => x.block - y.block);
-  for (const hit of candidates) {
-    // Leakage: some other band is far louder right here.
+  // Leakage: some other band is far louder right here.
+  const kept = candidates.filter((hit) => {
     let loudest = -Infinity;
     for (let b = 0; b < BAND_NAMES.length; b += 1) {
       if (b === hit.band) continue;
@@ -351,7 +365,21 @@ function detectHits(channels: Float32Array[], sampleRate: number): number[] {
         if (energy[b]![k]! > loudest) loudest = energy[b]![k]!;
       }
     }
-    if (loudest - hit.peak > DOMINANCE_DB) continue;
+    return loudest - hit.peak <= DOMINANCE_DB;
+  });
+
+  // One sound, several bands: only the band that dominates it keeps the hit.
+  const weighted = (hit: Hit) => hit.peak + BAND_BIAS_DB[hit.band]!;
+  const outranks = (other: Hit, hit: Hit) => other.band !== hit.band
+    && Math.abs(other.block - hit.block) <= COINCIDENT_BLOCKS
+    && weighted(other) > weighted(hit);
+  const hits: number[] = [];
+  for (let c = 0; c < kept.length; c += 1) {
+    const hit = kept[c]!;
+    let outranked = false;
+    for (let o = c - 1; o >= 0 && hit.block - kept[o]!.block <= COINCIDENT_BLOCKS && !outranked; o -= 1) outranked = outranks(kept[o]!, hit);
+    for (let o = c + 1; o < kept.length && kept[o]!.block - hit.block <= COINCIDENT_BLOCKS && !outranked; o += 1) outranked = outranks(kept[o]!, hit);
+    if (outranked) continue;
     const name = BAND_NAMES[hit.band]!;
     const velocity = Math.max(1, Math.min(127, Math.round(127 * (1 + (hit.peak - bandMax[hit.band]!) / ONSET_RANGE_DB))));
     hits.push((hit.block * block) / sampleRate, ((hit.end - hit.block) * block) / sampleRate, UNPITCHED_PITCH[name], velocity, 1);

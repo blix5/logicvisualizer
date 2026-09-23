@@ -17,7 +17,8 @@ import {
 } from '../../shared/model';
 import { LOGIC_PPQ } from '../../shared/timebase';
 import { TRANSCRIBED_FIELDS } from '../audio/transcribe';
-import { VELOCITY_BUCKETS } from './scene';
+import { levelStep, VELOCITY_BUCKETS } from './scene';
+import type { VolumeCurve } from '../../shared/automation';
 
 /** Semitones of headroom above and below the highest and lowest notes. */
 const PITCH_PAD = 2;
@@ -32,6 +33,10 @@ export type RollTrack = {
   duration: Float32Array;
   pitch: Uint8Array;
   bucket: Uint8Array;
+  /** Automation level step at each note's start, 0..LEVEL_STEPS; see scene.ts. */
+  level: Uint8Array;
+  /** The track's volume automation, for scaling converted notes' waveforms. */
+  volume: VolumeCurve | null;
   count: number;
   /** Longest note here, so a start-sorted search knows how far to back off. */
   maxDurationSeconds: number;
@@ -51,6 +56,8 @@ export type TranscriptLookup = (audioFileId: string) => Float32Array | null;
 export type RollAudio = {
   region: AudioRegionModel;
   color: string;
+  /** The owning track's volume automation. */
+  volume: VolumeCurve | null;
 };
 
 export type RollScene = {
@@ -131,7 +138,13 @@ function addTranscript(
   }
 }
 
-function buildTrack(trackId: string, color: string, raw: RawNotes, converted: boolean): RollTrack | null {
+function buildTrack(
+  trackId: string,
+  color: string,
+  raw: RawNotes,
+  converted: boolean,
+  volume: VolumeCurve | null,
+): RollTrack | null {
   const total = raw.start.length;
   if (total === 0) return null;
   const rawStart = raw.start;
@@ -147,6 +160,7 @@ function buildTrack(trackId: string, color: string, raw: RawNotes, converted: bo
   const duration = new Float32Array(total);
   const pitch = new Uint8Array(total);
   const bucket = new Uint8Array(total);
+  const level = new Uint8Array(total);
   const source = converted ? new Uint32Array(total) : undefined;
   let maxDurationSeconds = 0;
   for (let slot = 0; slot < total; slot += 1) {
@@ -155,10 +169,13 @@ function buildTrack(trackId: string, color: string, raw: RawNotes, converted: bo
     duration[slot] = rawDuration[i]!;
     pitch[slot] = rawPitch[i]!;
     bucket[slot] = rawBucket[i]!;
+    level[slot] = levelStep(volume, start[slot]!);
     if (source) source[slot] = raw.source[i]!;
     if (duration[slot]! > maxDurationSeconds) maxDurationSeconds = duration[slot]!;
   }
-  const track: RollTrack = { trackId, color, start, duration, pitch, bucket, count: total, maxDurationSeconds, converted };
+  const track: RollTrack = {
+    trackId, color, start, duration, pitch, bucket, level, volume, count: total, maxDurationSeconds, converted,
+  };
   if (source) {
     track.source = source;
     track.sources = raw.sources;
@@ -188,7 +205,7 @@ export function buildRollScene(model: ProjectModel, transcripts?: TranscriptLook
       if (region.pitchMin < pitchMin) pitchMin = region.pitchMin;
       if (region.pitchMax > pitchMax) pitchMax = region.pitchMax;
     } else {
-      audio.push({ region, color: track.color });
+      audio.push({ region, color: track.color, volume: track.volume ?? null });
       const duration = region.endSeconds - region.startSeconds;
       if (duration > maxAudioDurationSeconds) maxAudioDurationSeconds = duration;
     }
@@ -235,7 +252,7 @@ export function buildRollScene(model: ProjectModel, transcripts?: TranscriptLook
     }
     for (const track of ordered) {
       const raw = byTrack.get(track.id);
-      const built = raw ? buildTrack(track.id, track.color, raw, true) : null;
+      const built = raw ? buildTrack(track.id, track.color, raw, true, track.volume ?? null) : null;
       if (built) tracks.push(built);
     }
   }
@@ -244,7 +261,7 @@ export function buildRollScene(model: ProjectModel, transcripts?: TranscriptLook
     if (!regions) continue;
     const raw = rawNotes();
     for (const region of regions) addMidi(raw, region);
-    const built = buildTrack(track.id, track.color, raw, false);
+    const built = buildTrack(track.id, track.color, raw, false, track.volume ?? null);
     if (built) tracks.push(built);
   }
 
