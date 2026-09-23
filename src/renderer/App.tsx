@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { isFailure, type BounceFile } from '../shared/ipc';
 import type { ProjectModel } from '../shared/model';
 import { bpmAtBeat, buildBarGrid, buildTempoMap, secondsToBeats } from '../shared/timebase';
@@ -129,6 +129,9 @@ export function App(): JSX.Element {
   // state would re-render the whole app at frame rate, which on its own was a
   // meaningful share of the frame budget.
   const positionRef = useRef<HTMLSpanElement | null>(null);
+  /** The centred title, and the first control right of centre, for fitting one between the others. */
+  const headerTitleRef = useRef<HTMLDivElement | null>(null);
+  const offsetFieldRef = useRef<HTMLLabelElement | null>(null);
   const tempoRef = useRef<HTMLSpanElement | null>(null);
   const rendererRef = useRef<ArrangeRenderer | null>(null);
   const rollRendererRef = useRef<PianoRollRenderer | null>(null);
@@ -457,6 +460,7 @@ export function App(): JSX.Element {
           scrollTop: scrollTopRef.current,
           mode: view.mode,
           barGrid,
+          tempoMap,
           peaks: peaksLookup,
           bouncePeaks: bouncePeaksRef.current,
           bounceOffset: view.bounceOffset,
@@ -492,6 +496,28 @@ export function App(): JSX.Element {
     clock.toggle();
     setPlaying(clock.isPlaying);
   }, [ensureClock]);
+
+  // The centred title gets whatever the controls either side leave free, and
+  // ellipsizes past that rather than sliding under a control. Measured, since
+  // the controls change with the view, the project and the window width.
+  useLayoutEffect(() => {
+    const fit = () => {
+      const title = headerTitleRef.current;
+      if (!title) return;
+      const centre = window.innerWidth / 2;
+      const left = positionRef.current?.getBoundingClientRect();
+      const right = offsetFieldRef.current?.getBoundingClientRect();
+      const room = left && right
+        ? 2 * Math.min(centre - left.right, right.left - centre) - 24
+        : window.innerWidth - 240;
+      title.style.maxWidth = `${Math.max(80, Math.floor(room))}px`;
+      // Too narrow to show even a clipped name: the window title carries it.
+      title.style.visibility = room < 90 ? 'hidden' : '';
+    };
+    fit();
+    window.addEventListener('resize', fit);
+    return () => window.removeEventListener('resize', fit);
+  }, [headerHidden, mode, project, spectrumMode]);
 
   // Keyboard + wheel.
   useEffect(() => {
@@ -639,7 +665,7 @@ export function App(): JSX.Element {
             {/* The centre is taken by the title, which lives outside the toolbar. */}
             <span className="spacer" />
 
-            <label className="field" title="Bounce offset: shifts the bounce against the arrangement, in seconds">
+            <label className="field" ref={offsetFieldRef} title="Bounce offset: shifts the bounce against the arrangement, in seconds">
               <span className="field-label">Offset</span>
               <input
                 type="number"
@@ -732,7 +758,7 @@ export function App(): JSX.Element {
           Title and tempo, centred over the canvas. Outside the toolbar so they
           stay put, and stay visible, when it is hidden.
         */}
-        <div className="header-title">
+        <div className="header-title" ref={headerTitleRef}>
           <div className="title-row">
             <span className="title">{project ? project.projectName : 'Logic Visualizer'}</span>
             {project && (

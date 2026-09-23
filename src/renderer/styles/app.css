@@ -136,22 +136,26 @@ body {
   display: flex;
   align-items: baseline;
   gap: 10px;
+  max-width: 100%;
   line-height: 16px;
+}
+.header-title .readout.tempo { flex: none; }
+.header-title .readout.meta {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .header-title .readout.meta {
   font-size: 10.5px;
   line-height: 13px;
 }
 .header-title .title {
+  min-width: 0;
   font-size: 13px;
   font-weight: 600;
   color: var(--text);
-  /*
-   * Whatever the controls either side leave free, worked out per breakpoint
-   * below: the window width less twice the wider side, less the tempo and a
-   * margin. Long names ellipsize rather than slide under a control.
-   */
-  max-width: max(60px, calc(100vw - 1220px));
+  /* The block's max-width is set from the free room between the controls
+     (see App.tsx); a long name ellipsizes within it. */
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -336,16 +340,24 @@ label.field .field-unit {
 }
 
 /*
- * One line at any width, with the centred title clear of the controls either
- * side: the least essential pieces give way first.
+ * One line at any width: every control stays, but fields and the dropdown
+ * tighten as the window narrows, leaving the centred title more room.
  */
-@media (max-width: 1500px) {
-  .toolbar label.field.speed { display: none; }
-  .header-title .title { max-width: max(60px, calc(100vw - 1040px)); }
+@media (max-width: 1400px) {
+  .toolbar label.field { padding: 0 6px 0 7px; gap: 4px; }
+  .toolbar label.field input { width: 30px; }
+  .toolbar .dropdown-button span { max-width: 96px; overflow: hidden; text-overflow: ellipsis; }
 }
-@media (max-width: 1150px) {
-  .toolbar label.field { display: none; }
-  .header-title .title { max-width: max(60px, calc(100vw - 800px)); }
+@media (max-width: 1200px) {
+  .toolbar label.field .field-unit { display: none; }
+  .toolbar label.field .field-label { font-size: 11px; }
+  .toolbar .dropdown-button span { max-width: 64px; }
+}
+/* Narrower still, each field keeps just its value and unit ("0 s", "1 ×"). */
+@media (max-width: 1100px) {
+  .toolbar label.field .field-label { display: none; }
+  .toolbar label.field .field-unit { display: inline; }
+  .toolbar .dropdown-button span { max-width: 44px; }
 }
 
 .stage {

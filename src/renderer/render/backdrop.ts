@@ -33,6 +33,11 @@ export class Backdrop {
     this.version += 1;
   }
 
+  /** How much of the image shows, 0..1: overlays over it fade as this rises. */
+  get opacity(): number {
+    return this.active ? this.options.opacity : 0;
+  }
+
   get active(): boolean {
     return this.image !== null && this.options.opacity > 0;
   }

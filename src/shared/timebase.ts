@@ -117,7 +117,11 @@ export type BarGridEntry = {
   bar: number;
   beat: number;
   seconds: number;
+  /** Bar length in quarter-note beats: 3 for 6/8. */
   beatsInBar: number;
+  /** The bar's time signature, for counting its beats as Logic does (six in 6/8). */
+  numerator: number;
+  denominator: number;
 };
 
 /**
@@ -145,7 +149,7 @@ export function buildBarGrid(
     const beatsInBar = sig.numerator * (4 / sig.denominator);
     const seconds = beatsToSeconds(tempo, beat);
     if (seconds > untilSeconds) break;
-    grid.push({ bar, beat, seconds, beatsInBar });
+    grid.push({ bar, beat, seconds, beatsInBar, numerator: sig.numerator, denominator: sig.denominator });
     beat += beatsInBar;
     bar += 1;
   }

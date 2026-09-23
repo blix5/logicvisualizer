@@ -11,7 +11,7 @@
 //   2. Region and note fills are clamped to the viewport plus a margin: a
 //      region is as wide as it is long, which at high zoom is enormous.
 import { regionLabel, type AudioRegionModel, type RegionModel } from '../../shared/model';
-import type { BarGridEntry } from '../../shared/timebase';
+import { beatsToSeconds, type BarGridEntry, type TempoMap } from '../../shared/timebase';
 import { levelForPixelsPerSecond, peakCount, type PeakPyramid } from './peaks';
 import { fadeGain, hasFade } from './fade';
 import { volumeGain, type VolumeCurve } from '../../shared/automation';
@@ -44,6 +44,8 @@ export type ViewState = {
   scrollTop: number;
   mode: RenderMode;
   barGrid: BarGridEntry[];
+  /** Places beats inside a bar exactly across tempo changes; without it they are spaced evenly. */
+  tempoMap?: TempoMap | null;
   /**
    * Waveform peaks by audio file id. A lookup rather than scene data because
    * peaks arrive asynchronously while the scene is built once per project.
@@ -69,15 +71,25 @@ export type ViewState = {
 };
 
 const LANE_LABEL_WIDTH = 168;
-const RULER_HEIGHT = 26;
+const RULER_HEIGHT = 20;
+/** Smallest gap, in px, between two labels in the ruler. */
+const RULER_LABEL_GAP = 44;
+/** Beat and sixteenth lines appear once they are at least this far apart, in px. */
+const SUBDIVISION_MIN_PX = 12;
+/** Zoomed out, bar numbers thin to every nth bar, n from this list. */
+const BAR_LABEL_STEPS = [1, 2, 4, 8, 16, 32, 64, 128];
 /** Clamp margin, so clamped fills never show an edge inside the viewport. */
 const EDGE_MARGIN = 8;
 /**
- * Opacity of the grounds over a background image: lanes barely there so the
- * image reads as one picture rather than stripes, the ruler and label column
- * firmer so their text stays legible.
+ * Opacity of the grounds over a background image, for an image at `opacity`:
+ * lanes barely there so the image reads as one picture rather than stripes,
+ * the ruler and label column firmer so their text stays legible. All of them
+ * give way as the image is turned up.
  */
-const BACKDROP_VEIL = { lane: 0.18, ruler: 0.45, labels: 0.72 } as const;
+function backdropVeil(opacity: number): { lane: number; ruler: number; labels: number } {
+  const room = Math.max(0, 1 - opacity);
+  return { lane: 0.3 * room, ruler: 0.2 + 0.4 * room, labels: 0.4 + 0.45 * room };
+}
 const NO_VEIL = { lane: 1, ruler: 1, labels: 1 } as const;
 
 export function withAlpha(color: string, alpha: number): string {
@@ -135,7 +147,7 @@ export class ArrangeRenderer {
   private paintBackground(): void {
     const { ctx, canvas } = this;
     const layer = this.backdrop?.layerFor(canvas.width, canvas.height, this.dpr, this.theme.arrangeBg) ?? null;
-    this.veil = layer ? BACKDROP_VEIL : NO_VEIL;
+    this.veil = layer ? backdropVeil(this.backdrop?.opacity ?? 0) : NO_VEIL;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     if (layer) {
       ctx.drawImage(layer, 0, 0);
@@ -247,6 +259,11 @@ export class ArrangeRenderer {
     }
   }
 
+  /**
+   * The ruler and the grid lines under the lanes, divided as finely as the zoom
+   * allows, as Logic's ruler is: bar numbers (thinned to every 2nd, 4th, ...
+   * bar when zoomed out), then beats ("5.2"), then sixteenths ("5.2.3").
+   */
   private drawBarGrid(
     view: ViewState,
     toX: (s: number) => number,
@@ -255,17 +272,15 @@ export class ArrangeRenderer {
     windowStart: number,
     windowEnd: number,
   ): void {
-    const { ctx } = this;
-    const { theme } = this;
+    const { ctx, theme } = this;
     ctx.globalAlpha = this.veil.ruler;
     ctx.fillStyle = theme.rulerBg;
     ctx.fillRect(0, 0, width, RULER_HEIGHT);
     ctx.globalAlpha = 1;
-    ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
-    ctx.textBaseline = 'middle';
 
     // The grid runs the length of the song; seek into it rather than scanning
-    // every bar from the top on each frame.
+    // every bar from the top on each frame. One bar back, for the bar the
+    // window starts inside: its beats may be on screen.
     const grid = view.barGrid;
     let low = 0;
     let high = grid.length;
@@ -274,23 +289,107 @@ export class ArrangeRenderer {
       if ((grid[mid]?.seconds ?? Infinity) < windowStart) low = mid + 1;
       else high = mid;
     }
+    const first = Math.max(0, low - 1);
+    const pps = view.pixelsPerSecond;
+    const barSeconds = (i: number): number => {
+      const entry = grid[i]!;
+      const next = grid[i + 1] ?? grid[i - 1];
+      return next ? Math.abs(next.seconds - entry.seconds) : 2;
+    };
+    const firstBarPx = grid[first] ? barSeconds(first) * pps : 0;
+    const labelStep = BAR_LABEL_STEPS.find((step) => step * firstBarPx >= RULER_LABEL_GAP) ?? 128;
 
-    for (let i = low; i < grid.length; i += 1) {
+    const labelled = new Path2D();
+    const bars = new Path2D();
+    const beats = new Path2D();
+    const sixteenths = new Path2D();
+    const tallTicks = new Path2D();
+    const shortTicks = new Path2D();
+    type Label = { x: number; text: string };
+    const barLabels: Label[] = [];
+    const beatLabels: Label[] = [];
+    const sixteenthLabels: Label[] = [];
+    const line = (path: Path2D, x: number, top: number, bottom: number) => {
+      const px = Math.round(x) + 0.5;
+      path.moveTo(px, top);
+      path.lineTo(px, bottom);
+    };
+    const onScreen = (x: number) => x >= -2 && x <= width + 2;
+
+    for (let i = first; i < grid.length; i += 1) {
       const entry = grid[i];
       if (!entry) continue;
       if (entry.seconds > windowEnd) break;
       const x = toX(entry.seconds);
-      const major = (entry.bar - 1) % 4 === 0;
-      ctx.strokeStyle = major ? theme.gridMajor : theme.gridMinor;
-      ctx.beginPath();
-      ctx.moveTo(Math.round(x) + 0.5, RULER_HEIGHT);
-      ctx.lineTo(Math.round(x) + 0.5, height);
-      ctx.stroke();
-      if (major) {
-        ctx.fillStyle = theme.rulerText;
-        ctx.fillText(String(entry.bar), x + 4, RULER_HEIGHT / 2);
+      const isLabelled = (entry.bar - 1) % labelStep === 0;
+      if (onScreen(x)) {
+        line(isLabelled ? labelled : bars, x, RULER_HEIGHT, height);
+        line(isLabelled ? tallTicks : shortTicks, x, isLabelled ? 0 : RULER_HEIGHT - 6, RULER_HEIGHT);
+      }
+      if (isLabelled) barLabels.push({ x, text: String(entry.bar) });
+
+      // Beats count as the signature does: six in 6/8, each an eighth.
+      const beatCount = Math.max(1, entry.numerator);
+      const beatQuarters = entry.beatsInBar / beatCount;
+      const endSeconds = entry.seconds + barSeconds(i);
+      const beatPx = (endSeconds - entry.seconds) * pps / beatCount;
+      if (beatPx < SUBDIVISION_MIN_PX) continue;
+      const secondsAt = (beat: number): number => (view.tempoMap
+        ? beatsToSeconds(view.tempoMap, beat)
+        : entry.seconds + ((beat - entry.beat) / entry.beatsInBar) * (endSeconds - entry.seconds));
+      // Sixteenths: four to a quarter-note beat, two to an eighth.
+      const divisions = Math.max(1, Math.round(16 / entry.denominator));
+      const divisionPx = beatPx / divisions;
+      const showDivisions = divisions > 1 && divisionPx >= SUBDIVISION_MIN_PX;
+
+      for (let b = 0; b < beatCount; b += 1) {
+        const beatStart = entry.beat + b * beatQuarters;
+        const bx = toX(secondsAt(beatStart));
+        if (bx > width + 2) break;
+        if (b > 0 && onScreen(bx)) {
+          line(beats, bx, RULER_HEIGHT, height);
+          line(shortTicks, bx, RULER_HEIGHT - 6, RULER_HEIGHT);
+          if (beatPx >= RULER_LABEL_GAP) beatLabels.push({ x: bx, text: `${entry.bar}.${b + 1}` });
+        }
+        if (!showDivisions) continue;
+        for (let d = 1; d < divisions; d += 1) {
+          const dx = toX(secondsAt(beatStart + (d / divisions) * beatQuarters));
+          if (!onScreen(dx)) continue;
+          line(sixteenths, dx, RULER_HEIGHT, height);
+          line(shortTicks, dx, RULER_HEIGHT - 3, RULER_HEIGHT);
+          if (divisionPx >= RULER_LABEL_GAP) sixteenthLabels.push({ x: dx, text: `${entry.bar}.${b + 1}.${d + 1}` });
+        }
       }
     }
+
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = theme.gridMajor;
+    ctx.stroke(labelled);
+    ctx.strokeStyle = theme.gridMinor;
+    ctx.stroke(bars);
+    ctx.globalAlpha = 0.6;
+    ctx.stroke(beats);
+    ctx.globalAlpha = 0.3;
+    ctx.stroke(sixteenths);
+
+    ctx.strokeStyle = theme.rulerText;
+    ctx.globalAlpha = 0.55;
+    ctx.stroke(tallTicks);
+    ctx.globalAlpha = 0.35;
+    ctx.stroke(shortTicks);
+    ctx.globalAlpha = 1;
+
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = theme.rulerText;
+    const labelY = RULER_HEIGHT / 2 - 2;
+    ctx.font = '10.5px ui-monospace, SFMono-Regular, Menlo, monospace';
+    for (const label of barLabels) ctx.fillText(label.text, label.x + 4, labelY);
+    ctx.font = '9.5px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.globalAlpha = 0.7;
+    for (const label of beatLabels) ctx.fillText(label.text, label.x + 3, labelY);
+    ctx.globalAlpha = 0.5;
+    for (const label of sixteenthLabels) ctx.fillText(label.text, label.x + 3, labelY);
+    ctx.globalAlpha = 1;
   }
 
   private drawRegionBlock(

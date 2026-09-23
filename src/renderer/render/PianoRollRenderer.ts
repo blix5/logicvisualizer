@@ -74,8 +74,8 @@ const MAX_SPRITES = 48;
 const BACKGROUND_BUDGET = 0.32;
 /** Background waveforms sample every other column; nobody can see the difference. */
 const BACKGROUND_STEP = 2;
-/** Opacity of the roll's row stripes and wash over a background image. */
-const BACKDROP_SOFTEN = 0.3;
+/** Opacity of the roll's row stripes and wash over a background image, before it is turned up. */
+const BACKDROP_SOFTEN = 0.45;
 const BLACK_KEYS = new Set([1, 3, 6, 8, 10]);
 /**
  * Half-height of a converted note's waveform at full scale, in pitch rows. A
@@ -253,8 +253,9 @@ export class PianoRollRenderer {
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
 
     // Over a background image the row stripes, wash and vignette fade right
-    // back, or the picture reads as a set of dark bands.
-    const soft = image ? BACKDROP_SOFTEN : 1;
+    // back, or the picture reads as a set of dark bands; the more of the
+    // image shows, the further they fade.
+    const soft = image ? BACKDROP_SOFTEN * Math.max(0, 1 - (this.backdrop?.opacity ?? 0)) : 1;
 
     // A wash rising from the bottom, over the whole roll — the bounce band
     // included, since it is part of the roll rather than a strip of its own.
@@ -387,17 +388,21 @@ export class PianoRollRenderer {
     this.drawNotes(scene, view, toX, pps, width, playhead, windowStart, windowEnd);
     ctx.globalCompositeOperation = 'source-over';
     // Over a background image the shade runs the full height, so it reads as
-    // light falling off rather than a box laid over the picture.
+    // light falling off rather than a box laid over the picture, and it fades
+    // as the image is turned up: at full visibility the picture is untouched.
     const fullShade = !!this.backdrop?.active;
+    const shadeAlpha = fullShade ? Math.max(0, 1 - (this.backdrop?.opacity ?? 0)) : 1;
     if (this.pastShade && !fullShade) {
       ctx.fillStyle = this.pastShade;
       ctx.fillRect(KEY_WIDTH, clipTop, centreX - KEY_WIDTH, clipHeight);
     }
     this.drawFlashes(scene, centreX);
     ctx.restore();
-    if (this.pastShade && fullShade) {
+    if (this.pastShade && fullShade && shadeAlpha > 0) {
+      ctx.globalAlpha = shadeAlpha;
       ctx.fillStyle = this.pastShade;
       ctx.fillRect(KEY_WIDTH, 0, centreX - KEY_WIDTH, height);
+      ctx.globalAlpha = 1;
     }
 
     this.drawLitKeys(scene);
