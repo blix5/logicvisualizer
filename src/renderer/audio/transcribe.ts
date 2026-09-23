@@ -102,14 +102,19 @@ export function transcribe(channels: Float32Array[], sampleRate: number): Float3
   const factor = Math.max(1, Math.round(sampleRate / TARGET_RATE));
   const rate = sampleRate / factor;
   const length = Math.floor(first.length / factor);
-  const mono = new Float32Array(length);
+  // Half a window of silence either side, so frame centres run from the
+  // file's first sample to its last. Unpadded, the first centre sat ~186 ms
+  // in and a note at time zero lost that much of its start, or all of itself
+  // if it was shorter: the first note of every untrimmed region.
+  const pad = FFT_SIZE / 2;
+  const mono = new Float32Array(length + pad * 2);
   const scale = 1 / (factor * channels.length);
   for (const channel of channels) {
     for (let i = 0; i < length; i += 1) {
       let sum = 0;
       const base = i * factor;
       for (let k = 0; k < factor; k += 1) sum += channel[base + k] ?? 0;
-      mono[i] = mono[i]! + sum * scale;
+      mono[pad + i] = mono[pad + i]! + sum * scale;
     }
   }
 
@@ -132,7 +137,7 @@ export function transcribe(channels: Float32Array[], sampleRate: number): Float3
     binHigh[p] = Math.min(FFT_SIZE / 2 - 1, Math.max(binLow[p]!, Math.ceil((freq * 2 ** (1 / 24) * FFT_SIZE) / rate)));
   }
 
-  const frames = length >= FFT_SIZE ? Math.floor((length - FFT_SIZE) / HOP) + 1 : 0;
+  const frames = length >= FFT_SIZE ? Math.floor(length / HOP) + 1 : 0;
   // Too short for one pitch window, which a one-shot kick or hat often is:
   // the hit pass works at 10 ms blocks and can still place it.
   if (frames === 0) return Float32Array.from(detectHits(channels, sampleRate));
@@ -165,8 +170,10 @@ export function transcribe(channels: Float32Array[], sampleRate: number): Float3
 
   const floor = Math.max(ABSOLUTE_FLOOR_DB, fileMax - FILE_RANGE_DB);
   const secondsPerFrame = HOP / rate;
-  // A frame's energy describes its centre; a note starts half a hop before it.
-  const frameStart = (f: number) => (f * HOP + FFT_SIZE / 2) / rate - secondsPerFrame / 2;
+  const fileSeconds = length / rate;
+  // A frame's energy describes its centre, which the padding puts at f * HOP;
+  // a note starts half a hop before it.
+  const frameStart = (f: number) => (f * HOP) / rate - secondsPerFrame / 2;
 
   // Pass 2: one pitch per frame, or -1 where the frame is unvoiced.
   const raw = new Int16Array(frames).fill(-1);
@@ -217,7 +224,10 @@ export function transcribe(channels: Float32Array[], sampleRate: number): Float3
       for (let k = runStart; k < f; k += 1) sum += loudness[k]!;
       const mean = sum / frameCount;
       const velocity = Math.max(1, Math.min(127, Math.round(127 * (1 + (mean - fileMax) / FILE_RANGE_DB))));
-      out.push(frameStart(runStart), frameCount * secondsPerFrame, PITCH_LOW + p, velocity, 0);
+      // Clamped to the file: the first and last frames reach half a hop past it.
+      const start = Math.max(0, frameStart(runStart));
+      const end = Math.min(fileSeconds, frameStart(runStart) + frameCount * secondsPerFrame);
+      out.push(start, end - start, PITCH_LOW + p, velocity, 0);
     }
     runStart = f;
   }

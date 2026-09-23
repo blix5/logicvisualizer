@@ -18,12 +18,17 @@
 // rather than 0x24, and the region ref in a DIFFERENT slot: +8 (mirrored at
 // +32) where audio uses +44. Position shares the arrangement origin of 34560.
 //
-// Two gotchas carried over verbatim from Texture, both hard-won:
+// Three gotchas, the first two carried over verbatim from Texture:
 //   1. The note block has NO FIXED STRIDE. Logic interleaves 16-byte pad chunks
 //      between 32-byte note records but omits the pad after freshly inserted
 //      notes, so the walk must advance at 16-byte granularity.
 //   2. The block-length field may be little- OR big-endian depending on the
 //      project. Always probe both (readNoteBlockLength).
+//   3. A note's position is SIGNED about an origin of 38400: a note played
+//      just ahead of its region's start, or left hidden by trimming the
+//      region's left edge, is stored below the origin. Reading those as
+//      unsigned ticks from 0 dropped early-played first notes (keshi beat
+//      v33's violas, limbo's violas) and drew others bars late.
 import { scanRegionCells, type RegionCell } from './ops/regionCells';
 import { ARRANGE_TICK_ORIGIN } from './logicAudio';
 
@@ -33,7 +38,9 @@ export const LOGIC_BAR1_TICK_ORIGIN = 38400;
 const NOTE_BLOCK_SIZE = 32;
 const NOTE_PAD_CHUNK_SIZE = 16;
 const NOTE_BLOCK_END_SENTINEL = 0xf1;
+/** Note-on, any channel: the low nibble is the MIDI channel. */
 const NOTE_STATUS = 0x90;
+const STATUS_TYPE_MASK = 0xf0;
 const NOTE_END_MARKER = 0x89;
 const NOTE_END_MARKER_OFFSET = 23;
 const NOTE_POS_OFFSET = 4;
@@ -47,7 +54,7 @@ const QSVE_TO_FIRST_NOTE = 36;
 const MAX_REASONABLE_NOTES = 200_000;
 
 export type LogicNote = {
-  /** Ticks from the start of the owning region. */
+  /** Ticks from the start of the owning region; negative if it starts before it. */
   startTicks: number;
   durationTicks: number;
   pitch: number;
@@ -167,7 +174,7 @@ function readNoteBlockLength(buffer: Buffer, qSveOffset: number): number | null 
 }
 
 function ticksFromOrigin(raw: number): number {
-  return raw >= LOGIC_BAR1_TICK_ORIGIN ? raw - LOGIC_BAR1_TICK_ORIGIN : raw;
+  return raw - LOGIC_BAR1_TICK_ORIGIN;
 }
 
 /**
@@ -178,16 +185,18 @@ function ticksFromOrigin(raw: number): number {
  * 194 of the 2,047 MIDI regions in ~/Music/Logic have notes running past their
  * end, by up to 10 bars — those were all being drawn.
  *
- * Only the end is clipped. Nothing in the corpus starts before its region
- * (minimum note start is never negative), and no cell field matches the first
- * note's offset, so notes that begin late are genuine rests rather than a
- * start-trim that would need shifting.
+ * The start is different: a note that begins before the region but is still
+ * sounding at its start is kept at its true position. 77 notes in 62 regions
+ * of the corpus start early, mostly by a few ticks to a beat, played ahead of
+ * the downbeat that opens the region. Notes that END by the region's start are
+ * what a left-edge trim hides, and are dropped.
  */
 function clipNotesToRegion(notes: LogicNote[], lengthTicks: number): LogicNote[] {
   if (lengthTicks <= 0) return notes;
   const clipped: LogicNote[] = [];
   for (const note of notes) {
     if (note.startTicks >= lengthTicks) continue;
+    if (note.startTicks + note.durationTicks <= 0) continue;
     const available = lengthTicks - note.startTicks;
     clipped.push(note.durationTicks <= available
       ? note
@@ -207,7 +216,7 @@ export function readRegionNotes(buffer: Buffer, qSveOffset: number): LogicNote[]
   while (at + NOTE_BLOCK_SIZE <= end) {
     if (buffer.readUInt8(at) === NOTE_BLOCK_END_SENTINEL) break;
     if (
-      buffer.readUInt8(at) === NOTE_STATUS
+      (buffer.readUInt8(at) & STATUS_TYPE_MASK) === NOTE_STATUS
       && buffer.readUInt8(at + NOTE_END_MARKER_OFFSET) === NOTE_END_MARKER
     ) {
       notes.push({

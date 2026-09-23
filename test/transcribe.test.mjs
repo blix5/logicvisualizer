@@ -127,3 +127,25 @@ test('a bass note starting after silence is pitched, not a kick', () => {
   assert.ok(found.some((n) => !n.unpitched && n.pitch === 45), 'bass note missing');
   assert.ok(!found.some((n) => n.unpitched && n.pitch === UNPITCHED_PITCH.low), 'bass onset doubled as a kick');
 });
+
+test('a note at the very start of a file starts at zero, not a window later', () => {
+  // The first pitch frame used to be centred ~186 ms in, so the first note of
+  // every untrimmed region lost that much of its start, or vanished if shorter.
+  const data = new Float32Array(RATE * 2);
+  data.set(tone(0.5, [{ pitch: 60, amp: 0.5 }]), 0);
+  const found = pitchedNotes(transcribe([data], RATE));
+  assert.equal(found[0]?.pitch, 60, JSON.stringify(found));
+  assert.ok(found[0].start < 0.03, `starts at ${found[0].start}`);
+
+  const short = new Float32Array(RATE);
+  short.set(tone(0.12, [{ pitch: 60, amp: 0.5 }]), 0);
+  const quick = pitchedNotes(transcribe([short], RATE));
+  assert.ok(quick.some((n) => n.pitch === 60 && n.start < 0.03), `short first note: ${JSON.stringify(quick)}`);
+});
+
+test('pitched notes stay inside the file', () => {
+  const found = pitchedNotes(transcribe([tone(1, [{ pitch: 69, amp: 0.5 }])], RATE));
+  for (const n of found) {
+    assert.ok(n.start >= 0 && n.start + n.dur <= 1 + 1e-6, JSON.stringify(n));
+  }
+});

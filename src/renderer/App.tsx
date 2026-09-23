@@ -20,6 +20,7 @@ import {
 } from './components/icons';
 import { AppearanceMenu } from './components/AppearancePanel';
 import { Dropdown } from './components/Dropdown';
+import { NumberField } from './components/NumberField';
 import { RecentGrid, RecentMenu, useRecentProjects } from './components/RecentProjects';
 import { TranscriptionStore } from './audio/TranscriptionStore';
 import { reduceBufferPeaks } from './audio/reducePeaks';
@@ -667,25 +668,24 @@ export function App(): JSX.Element {
 
             <label className="field" ref={offsetFieldRef} title="Bounce offset: shifts the bounce against the arrangement, in seconds">
               <span className="field-label">Offset</span>
-              <input
-                type="number"
+              <NumberField
                 step="0.01"
                 value={bounceOffset}
-                onChange={(e) => setBounceOffset(Number(e.target.value) || 0)}
+                onCommit={setBounceOffset}
                 onKeyDown={blurOnCommit}
               />
               <span className="field-unit">s</span>
             </label>
             <label className="field speed" title="Playback speed">
               <span className="field-label">Speed</span>
-              <input
-                type="number"
+              <NumberField
                 step="0.05"
                 min="0.1"
                 max="4"
                 value={rate}
-                onChange={(e) => {
-                  const next = Number(e.target.value) || 1;
+                // "0." on the way to "0.5" is not a speed to play at.
+                isValid={(next) => next >= 0.1 && next <= 4}
+                onCommit={(next) => {
                   setRate(next);
                   clockRef.current?.setRate(next);
                 }}

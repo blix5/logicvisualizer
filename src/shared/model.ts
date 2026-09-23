@@ -83,7 +83,10 @@ type RegionBase = {
   transposeSemitones: number;
 };
 
-/** 4 ints per note: [startTicksRelativeToRegion, durationTicks, pitch, velocity]. */
+/**
+ * 4 ints per note: [startTicksRelativeToRegion, durationTicks, pitch, velocity].
+ * The start can be negative: a note played just ahead of its region still sounds.
+ */
 export const NOTE_STRIDE = 4;
 export function noteStart(n: Int32Array, i: number): number { return n[i * NOTE_STRIDE] ?? 0; }
 export function noteDuration(n: Int32Array, i: number): number { return n[i * NOTE_STRIDE + 1] ?? 0; }
