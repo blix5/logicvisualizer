@@ -98,7 +98,20 @@ function findAllTags(buffer: Buffer, tag: string): number[] {
   return offsets;
 }
 
-export function parseAutomationLanes(buffer: Buffer): AutomationLane[] {
+/**
+ * Every automation lane in the file. `automationChunks` names the qSvE chunks
+ * known to be automation (their cell is named "*Automation"); in those, any row
+ * that is not a 0x0050 record is skipped. Anywhere else an unknown row rejects
+ * the chunk, since it is probably not automation at all.
+ *
+ * Real automation carries far more than 0x0050 rows: markers 0x51-0x58 (with
+ * parameter ids like 0x1d, float-valued: plugin parameters, not decoded), 0x8050
+ * and, in djpubichair, 0xe0. Rejecting a whole chunk on them dropped 27 of the
+ * 96 volume lanes in ~/Music/Logic, among them djpubichair's "drums" stack, whose
+ * owner drew 0 dB at bar 25 to -inf at bar 41 on a chunk also holding 182 rows
+ * of marker 0x54.
+ */
+export function parseAutomationLanes(buffer: Buffer, automationChunks: ReadonlySet<number> = new Set()): AutomationLane[] {
   const lanes: AutomationLane[] = [];
   for (const tagOffset of findAllTags(buffer, QSVE_TAG)) {
     if (tagOffset + QSVE_BLOCK_LENGTH_OFFSET + 4 > buffer.length) continue;
@@ -108,6 +121,7 @@ export function parseAutomationLanes(buffer: Buffer): AutomationLane[] {
     if (count < MIN_RECORDS) continue;
     const first = tagOffset + QSVE_FIRST_RECORD_OFFSET;
     if (first + payload > buffer.length) continue;
+    const known = automationChunks.has(tagOffset);
 
     // Points for every parameter share the chunk, so collect per parameter id.
     const byParameter = new Map<number, AutomationPoint[]>();
@@ -124,6 +138,7 @@ export function parseAutomationLanes(buffer: Buffer): AutomationLane[] {
       // lane in the project.
       if (marker === FLOAT_RECORD_MARKER) continue;
       if (marker === 0 && buffer.readUInt32LE(at + 2) === 0) continue;
+      if (known && marker !== RECORD_MARKER) continue;
       if (marker !== RECORD_MARKER) { valid = false; break; }
       pointCount += 1;
       const rawTick = buffer.readUInt32LE(at + POSITION_OFFSET)
@@ -161,10 +176,21 @@ export function parseAutomationLanes(buffer: Buffer): AutomationLane[] {
  * (the arp swells), the 808 bass, a reverb aux, and "guitar feedback thing"
  * (volume and pan).
  */
-export function attributeAutomationLanes(buffer: Buffer, lanes: AutomationLane[]): AutomationLane[] {
+export function attributeAutomationLanes(
+  buffer: Buffer,
+  lanes: AutomationLane[],
+  cells: ReturnType<typeof scanRegionCells> = scanRegionCells(buffer),
+): AutomationLane[] {
   const refByQsve = new Map<number, number>();
-  for (const cell of scanRegionCells(buffer)) refByQsve.set(cell.qsve, cell.trackRef);
+  for (const cell of cells) refByQsve.set(cell.qsve, cell.trackRef);
   return lanes.map((lane) => ({ ...lane, trackRef: refByQsve.get(lane.chunkOffset) ?? null }));
+}
+
+/** Every automation lane, attributed to its track. */
+export function parseAttributedAutomationLanes(buffer: Buffer): AutomationLane[] {
+  const cells = scanRegionCells(buffer);
+  const automationChunks = new Set(cells.filter((cell) => cell.name === '*Automation').map((cell) => cell.qsve));
+  return attributeAutomationLanes(buffer, parseAutomationLanes(buffer, automationChunks), cells);
 }
 
 /**
@@ -173,7 +199,7 @@ export function attributeAutomationLanes(buffer: Buffer, lanes: AutomationLane[]
  */
 export function parseTrackVolumeAutomation(buffer: Buffer): Map<number, AutomationPoint[]> {
   const byRef = new Map<number, AutomationPoint[]>();
-  for (const lane of attributeAutomationLanes(buffer, parseAutomationLanes(buffer))) {
+  for (const lane of parseAttributedAutomationLanes(buffer)) {
     if (lane.parameterId !== AUTOMATION_PARAM_VOLUME || lane.trackRef === null) continue;
     const existing = byRef.get(lane.trackRef);
     if (!existing || lane.points.length > existing.length) byRef.set(lane.trackRef, lane.points);

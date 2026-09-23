@@ -57,6 +57,29 @@ export function faderToLevel(fader: number): number {
   return Math.max(0, Math.min(1, fader / FADER_UNITY));
 }
 
+/**
+ * Several faders in series as one curve: a channel feeding a summing stack is
+ * heard through both faders. Gains multiply, so under the (v/90)² law the
+ * combined fader is 90 · Π(v/90), sampled at every point of every curve.
+ */
+export function combineVolumeCurves(curves: VolumeCurve[]): VolumeCurve | null {
+  if (curves.length === 0) return null;
+  if (curves.length === 1) return curves[0]!;
+  const all: number[] = [];
+  for (const curve of curves) for (const t of curve.seconds) all.push(t);
+  all.sort((a, b) => a - b);
+  const times: number[] = [];
+  for (const t of all) if (times.length === 0 || t !== times[times.length - 1]) times.push(t);
+  const seconds = Float64Array.from(times);
+  const fader = new Float32Array(times.length);
+  times.forEach((t, i) => {
+    let value = FADER_UNITY;
+    for (const curve of curves) value *= faderAt(curve, t) / FADER_UNITY;
+    fader[i] = value;
+  });
+  return { seconds, fader };
+}
+
 /** Amplitude multiplier at `seconds`, or 1 when the track has no automation. */
 export function volumeGain(curve: VolumeCurve | null, seconds: number): number {
   return curve ? faderToAmplitude(faderAt(curve, seconds)) : 1;

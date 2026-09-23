@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { buildProjectModel } from '../.test-build/buildProject.mjs';
 import { regionLabel } from '../.test-build/model.mjs';
-import { buildTempoMap, secondsToBeats } from '../.test-build/timebase.mjs';
+import { buildTempoMap, beatsToSeconds, secondsToBeats } from '../.test-build/timebase.mjs';
+import { faderAt } from '../.test-build/automation.mjs';
 
 // Gated on an env var with a sensible default rather than a hardcoded absolute
 // path, so this suite actually runs on a machine that has projects.
@@ -35,6 +36,20 @@ test('real projects parse and satisfy the model invariants', { skip: projects.le
         assert.ok(region.startSeconds >= previous, 'regions are sorted by start time');
         previous = region.startSeconds;
         assert.ok(model.tracks.some((t2) => t2.id === region.trackId), `${region.name} lands on a real track`);
+      }
+
+      // When the arrange list is found it numbers every track 1..n, and each
+      // stack member sits exactly one level below a stack head.
+      if (model.tracks.some((t2) => t2.number !== null)) {
+        model.tracks.forEach((track, i) => assert.equal(track.number, i + 1, `${track.name} is track ${i + 1}`));
+        const byId = new Map(model.tracks.map((t2) => [t2.id, t2]));
+        for (const track of model.tracks) {
+          if (track.depth === 0) { assert.equal(track.parentId, null); continue; }
+          const parent = byId.get(track.parentId);
+          assert.ok(parent?.stack, `${track.name}'s parent is a stack head`);
+          assert.equal(parent.depth, track.depth - 1);
+          assert.ok(parent.number < track.number, 'a member follows its head');
+        }
       }
 
       for (const file of model.audioFiles) {
@@ -260,4 +275,107 @@ test('volume lanes interleaved with other rows still decode', {
   assert.equal(faderAt(at(16, 3, 2, 100)), 0, '-inf through the hold');
   assert.ok(faderAt(at(16, 4, 3, 0)) > 20 && faderAt(at(16, 4, 3, 0)) < 90, 'easing back up');
   assert.equal(faderAt(at(17, 1, 1, 10)), 90, 'back to 0 dB at bar 17');
+});
+
+test('summing stacks decode from the arrange list', {
+  skip: !fs.existsSync(path.join(root, 'djpubichair.logicx')) && 'djpubichair.logicx not found',
+}, () => {
+  // Ground truth is the owner's reading of Logic's track headers: six summing
+  // stacks, each member listed by track number. Track 7 is in the lead stack
+  // but its output is Stereo Out, which its channel inspector confirms; it
+  // reaches the stack only through its Bus 1 send to track 8's reverb aux.
+  const model = buildProjectModel(path.join(root, 'djpubichair.logicx'));
+  const byNumber = new Map(model.tracks.map((t) => [t.number, t]));
+  const stacks = {
+    1: ['lead', [2, 3, 4, 5, 6, 7, 8]],
+    10: ['outro', [11, 12, 13]],
+    15: ['instrumentals', [16, 17, 18, 19, 20, 21, 22, 23]],
+    26: ['bass sum', [27, 28, 29, 30]],
+    32: ['sfx', [33, 34, 35, 36, 37]],
+    38: ['drums', [39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52]],
+  };
+  assert.deepEqual(model.tracks.filter((t) => t.stack).map((t) => t.number), [1, 10, 15, 26, 32, 38]);
+  for (const [headNumber, [name, members]] of Object.entries(stacks)) {
+    const head = byNumber.get(Number(headNumber));
+    assert.equal(head.name, name);
+    assert.deepEqual(head.stack, { summing: true, expanded: true });
+    assert.equal(head.channel.kind, 'aux');
+    const found = model.tracks.filter((t) => t.parentId === head.id).map((t) => t.number);
+    assert.deepEqual(found, members, `${name} holds tracks ${members.join(', ')}`);
+    for (const number of members) {
+      const member = byNumber.get(number);
+      if (number === 7) continue;
+      assert.equal(member.channel.outputBus, head.channel.inputBus, `track ${number} outputs to ${name}'s bus`);
+    }
+  }
+  assert.equal(byNumber.get(7).name, 'Soft Cinematic');
+  assert.equal(byNumber.get(7).channel.outputBus, null, 'Soft Cinematic outputs to Stereo Out');
+  const hall = byNumber.get(8);
+  assert.equal(hall.name, 'Large Hall/Concert Hall');
+  assert.deepEqual(hall.channel, { name: 'Aux 1', kind: 'aux', outputBus: 4, inputBus: 1 });
+  // Names the old reader mangled: a C-string read ran on past the length, and
+  // trailing digits were stripped.
+  assert.equal(byNumber.get(33).name, 'glitch 1');
+  assert.equal(byNumber.get(9).name, 'Liquid Crystal');
+  // Its channel UUID contains 0xff, which defeated the channel join.
+  assert.equal(byNumber.get(23).channel?.name, 'Inst 7');
+  assert.equal(model.tracks.length, 57, 'Stereo Out, Master and bare aux strips are not tracks');
+});
+
+test('nested and collapsed stacks decode', {
+  skip: !fs.existsSync(path.join(root, 'limbo.logicx')) && 'limbo.logicx not found',
+}, () => {
+  // limbo's WindowImage: "Sum 18" (open) holds two "Natural Finger Pick"
+  // stacks (both closed), each holding a Natural Finger Pick, Left and Right.
+  // Tracks 10 and 11 have node type 10 and used to be dropped from the order.
+  const model = buildProjectModel(path.join(root, 'limbo.logicx'));
+  const byNumber = new Map(model.tracks.map((t) => [t.number, t]));
+  assert.equal(byNumber.get(1).name, 'Sum 18');
+  assert.equal(byNumber.get(1).stack.expanded, true);
+  for (const head of [2, 6]) {
+    assert.equal(byNumber.get(head).parentId, byNumber.get(1).id);
+    assert.equal(byNumber.get(head).stack.expanded, false);
+    assert.deepEqual(model.tracks.filter((t) => t.parentId === byNumber.get(head).id).map((t) => [t.number, t.depth]),
+      [[head + 1, 2], [head + 2, 2], [head + 3, 2]]);
+  }
+  assert.equal(byNumber.get(10).name, 'Brit and Clean');
+  assert.equal(byNumber.get(11).name, 'Brit and Clean');
+  assert.equal(byNumber.get(12).name, 'soft piano');
+});
+
+test('a stack\'s mute and volume reach the tracks routed into it', {
+  skip: !fs.existsSync(path.join(root, 'djpubichair.logicx')) && 'djpubichair.logicx not found',
+}, () => {
+  // The owner muted the "sfx" stack (32) and drew volume automation on the
+  // "drums" stack (38): 0 dB at bar 25 falling to -inf at bar 41.
+  const model = buildProjectModel(path.join(root, 'djpubichair.logicx'));
+  const byNumber = new Map(model.tracks.map((t) => [t.number, t]));
+  const sfx = byNumber.get(32);
+  assert.equal(sfx.mutedBy, sfx.id);
+  for (const n of [33, 34, 35, 36, 37]) {
+    assert.equal(byNumber.get(n).muted, true, `track ${n} is silenced by sfx`);
+    assert.equal(byNumber.get(n).mutedBy, sfx.id);
+  }
+  assert.equal(byNumber.get(31).muted, false, 'the track before the stack is not');
+
+  const drums = byNumber.get(38);
+  assert.ok(drums.ownVolume, 'the drums stack has its own lane');
+  const tempoMap = buildTempoMap(model.tempoEvents, model.baseBpm);
+  const atBar = (bar) => beatsToSeconds(tempoMap, (bar - 1) * 4);
+  assert.equal(faderAt(drums.ownVolume, atBar(25)), 90);
+  assert.ok(Math.abs(faderAt(drums.ownVolume, atBar(33)) - 45) < 0.5, 'half way down at bar 33');
+  assert.equal(faderAt(drums.ownVolume, atBar(41.5)), 0);
+  const kick = byNumber.get(39);
+  assert.equal(kick.ownVolume, null);
+  assert.ok(Math.abs(faderAt(kick.volume, atBar(33)) - 45) < 0.5, 'the kick is heard through it');
+  assert.equal(faderAt(kick.volume, atBar(41.5)), 0);
+
+  // "Soft Cinematic" (7) sits in the lead stack but outputs to Stereo Out, so
+  // the automation on "lead" (1) does not reach it; the reverb aux (8), which
+  // outputs to lead's bus, is heard through it.
+  const soft = byNumber.get(7);
+  assert.equal(soft.volume, soft.ownVolume);
+  const hall = byNumber.get(8);
+  assert.notEqual(hall.volume, hall.ownVolume);
+  assert.ok(hall.volume.seconds.length >= byNumber.get(1).ownVolume.seconds.length);
 });

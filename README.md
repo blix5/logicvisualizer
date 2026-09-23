@@ -63,6 +63,7 @@ Dev CLIs, which need no UI and are how the parser is actually developed:
 ```bash
 node scripts/probe.mjs "~/Music/Logic/solace.logicx"   # dump one parsed project
 node scripts/probe.mjs "<path>" --json                 # the full model
+node scripts/probe.mjs "<path>" --tracks               # track list with stacks and bus routing
 node scripts/sweep.mjs                                 # parse every project, one line each
 ```
 

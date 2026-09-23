@@ -15,7 +15,9 @@ import {
   resolveTrackChannelNamesByRef,
   resolveTrackChannelsByRef,
   listTrackStrips,
+  type TrackStrip,
 } from '../logic/trackNames';
+import { readArrangeTree } from '../logic/trackTree';
 import { findTempoLists } from '../logic/ops/tempo';
 import { selectTempoEvents } from './tempoSelect';
 import { findSignatureLists } from '../logic/ops/timeSignature';
@@ -34,6 +36,7 @@ import {
 import type {
   AudioFileModel,
   AudioRegionModel,
+  ChannelModel,
   MarkerModel,
   MidiRegionModel,
   ProjectModel,
@@ -41,6 +44,7 @@ import type {
   TrackModel,
 } from '../../shared/model';
 import { NOTE_STRIDE } from '../../shared/model';
+import { combineVolumeCurves, type VolumeCurve } from '../../shared/automation';
 import { fallbackTrackColor } from './palette';
 import { flexedBeats, readFileTempo } from '../audio/fileTempo';
 
@@ -122,59 +126,99 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
   const channelsByRef = resolveTrackChannelsByRef(buffer);
   const tracks: TrackModel[] = [];
   const trackIdByRef = new Map<number, string>();
+  /** `${stripRef}#${number}` -> id, for tracks that share a strip. */
+  const trackIdByKey = new Map<string, string>();
 
-  // Arrange ordinals come from the object-registry walk when it succeeds; it
-  // refuses some real projects outright, so the ivnE strip scan is the source
-  // of truth for WHICH tracks exist and the registry only refines the order.
-  const ordinalByRef = new Map<number, number>();
-  try {
-    for (const listed of listLogicTracks(buffer)) {
-      ordinalByRef.set(listed.strip_ref, listed.arrange_ordinal);
+  const channelFor = (refKey: string): ChannelModel | null => {
+    const info = channelsByRef.get(refKey);
+    return info ? { name: info.name, kind: info.kind, outputBus: info.outputBus, inputBus: info.inputBus } : null;
+  };
+  const newTrack = (ref: number, name: string, arrangeIndex: number): TrackModel => ({
+    id: `t${ref}`,
+    arrangeIndex,
+    name,
+    kind: 'unknown',
+    color: fallbackTrackColor(tracks.length, 'unknown'),
+    colorSource: 'fallback',
+    trackRef: ref,
+    muted: channelsByRef.get(`0x${ref.toString(16)}`)?.muted ?? false,
+    mutedBy: null,
+    volume: null,
+    ownVolume: null,
+    number: null,
+    depth: 0,
+    parentId: null,
+    stack: null,
+    channel: channelFor(`0x${ref.toString(16)}`),
+  });
+
+  const strips = listTrackStrips(buffer);
+  const arrangeTree = readArrangeTree(buffer);
+  if (arrangeTree) {
+    // The song-root folder lists exactly the tracks Logic shows, in its order,
+    // with stack nesting. Strips it does not list (Stereo Out, Master, aux
+    // strips with no arrange track) are not tracks.
+    const stripByRef = new Map<number, TrackStrip>();
+    for (const strip of strips) if (!stripByRef.has(strip.ref)) stripByRef.set(strip.ref, strip);
+    for (const node of arrangeTree) {
+      const strip = stripByRef.get(node.stripRef);
+      const refKey = `0x${node.stripRef.toString(16)}`;
+      const name = strip?.exactName
+        || strip?.name
+        || namesByRef.get(refKey)
+        || channelNamesByRef.get(refKey)
+        || `Track ${node.number}`;
+      const track = newTrack(node.stripRef, name, node.number - 1);
+      // Two tracks can share one channel strip (dark.logicx's 2 and 3; the
+      // second has node type 5). Placements name their track by number as
+      // well as strip, so the later one gets its own id and trackIdFor finds it.
+      if (trackIdByRef.has(node.stripRef)) track.id = `t${node.stripRef}.${node.number}`;
+      trackIdByKey.set(`${node.stripRef}#${node.number}`, track.id);
+      track.number = node.number;
+      track.depth = node.depth;
+      track.parentId = node.parentRef === null ? null : `t${node.parentRef}`;
+      if (node.stackHead) {
+        track.stack = { summing: track.channel?.kind === 'aux', expanded: node.expanded };
+      }
+      if (!trackIdByRef.has(node.stripRef)) trackIdByRef.set(node.stripRef, track.id);
+      tracks.push(track);
     }
-  } catch {
-    warnings.push('Track order unavailable; falling back to track-strip order in the file.');
-  }
-
-  for (const strip of listTrackStrips(buffer)) {
-    const name = strip.name
-      || namesByRef.get(strip.refKey)
-      || channelNamesByRef.get(strip.refKey);
-    if (!name) continue;
-    const id = `t${strip.ref}`;
-    if (trackIdByRef.has(strip.ref)) continue;
-    trackIdByRef.set(strip.ref, id);
-    tracks.push({
-      id,
-      arrangeIndex: ordinalByRef.get(strip.ref) ?? tracks.length,
-      name,
-      kind: 'unknown',
-      color: fallbackTrackColor(tracks.length, 'unknown'),
-      colorSource: 'fallback',
-      trackRef: strip.ref,
-      muted: channelsByRef.get(strip.refKey)?.muted ?? false,
-      volume: null,
-    });
+  } else {
+    // Arrange ordinals come from the object-registry walk when it succeeds; it
+    // refuses some real projects outright, so the ivnE strip scan is the source
+    // of truth for WHICH tracks exist and the registry only refines the order.
+    const ordinalByRef = new Map<number, number>();
+    try {
+      for (const listed of listLogicTracks(buffer)) {
+        ordinalByRef.set(listed.strip_ref, listed.arrange_ordinal);
+      }
+    } catch {
+      warnings.push('Track order unavailable; falling back to track-strip order in the file.');
+    }
+    for (const strip of strips) {
+      const name = strip.name
+        || namesByRef.get(strip.refKey)
+        || channelNamesByRef.get(strip.refKey);
+      if (!name) continue;
+      if (trackIdByRef.has(strip.ref)) continue;
+      // Unlisted strips go after every listed track, in file order. Using the
+      // running count as their index collided with real ordinals and put
+      // Stereo Out and Master among the first tracks.
+      const track = newTrack(strip.ref, name, ordinalByRef.get(strip.ref) ?? ordinalByRef.size + tracks.length);
+      trackIdByRef.set(strip.ref, track.id);
+      tracks.push(track);
+    }
   }
   tracks.sort((a, b) => a.arrangeIndex - b.arrangeIndex);
   tracks.forEach((track, index) => { track.arrangeIndex = index; });
 
-  function trackIdFor(trackRef: number, fallbackIndex: number): string {
-    const existing = trackIdByRef.get(trackRef);
+  function trackIdFor(trackRef: number, trackNumber: number): string {
+    const existing = trackIdByKey.get(`${trackRef}#${trackNumber}`) ?? trackIdByRef.get(trackRef);
     if (existing) return existing;
     const id = `t${trackRef}`;
     if (!tracks.some((t) => t.id === id)) {
       trackIdByRef.set(trackRef, id);
-      tracks.push({
-        id,
-        arrangeIndex: tracks.length,
-        name: namesByRef.get(`0x${trackRef.toString(16)}`) ?? `Track ${tracks.length + 1}`,
-        kind: 'unknown',
-        color: fallbackTrackColor(tracks.length, 'unknown'),
-        colorSource: 'fallback',
-        trackRef,
-        muted: channelsByRef.get(`0x${trackRef.toString(16)}`)?.muted ?? false,
-        volume: null,
-      });
+      tracks.push(newTrack(trackRef, namesByRef.get(`0x${trackRef.toString(16)}`) ?? `Track ${tracks.length + 1}`, tracks.length));
     }
     return id;
   }
@@ -190,7 +234,7 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
   for (const parsed of parseMidiRegions(buffer, maxTrackNumber)) {
     if (parsed.notes.length === 0) continue; // empty cells and pool entries
     midiRegionCount += 1;
-    const trackId = trackIdFor(parsed.trackRef, parsed.trackNumber - 1);
+    const trackId = trackIdFor(parsed.trackRef, parsed.trackNumber);
     const track = tracks.find((t) => t.id === trackId);
     if (track) track.kind = 'midi';
 
@@ -282,7 +326,7 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
   let flexUnresolved = 0;
 
   for (const region of placed) {
-    const trackId = trackIdFor(region.trackRef, region.trackNumber - 1);
+    const trackId = trackIdFor(region.trackRef, region.trackNumber);
     const track = tracks.find((t) => t.id === trackId);
     if (track && track.kind === 'unknown') track.kind = 'audio';
 
@@ -353,21 +397,66 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
   }
 
   // ---- volume automation -------------------------------------------------
+  // Per strip, not per track: an aux with no arrange track can still carry the
+  // automation or the mute that its inputs are heard through.
+  const ownVolumeByRef = new Map<number, VolumeCurve>();
   try {
-    const volumeByRef = parseTrackVolumeAutomation(buffer);
-    for (const track of tracks) {
-      const points = volumeByRef.get(track.trackRef);
-      if (!points || points.length === 0) continue;
+    for (const [ref, points] of parseTrackVolumeAutomation(buffer)) {
+      if (points.length === 0) continue;
       const seconds = new Float64Array(points.length);
       const fader = new Float32Array(points.length);
       points.forEach((point, i) => {
         seconds[i] = beatsToSeconds(tempoMap, point.positionTicks / LOGIC_PPQ);
         fader[i] = point.value;
       });
-      track.volume = { seconds, fader };
+      ownVolumeByRef.set(ref, { seconds, fader });
     }
   } catch (error) {
     warnings.push(`Volume automation unreadable: ${(error as Error).message}`);
+  }
+
+  // ---- what each track is heard through ----------------------------------
+  // A channel is heard through every Aux its output feeds, hop by hop to Stereo
+  // Out: a summing stack's members through its main track, a reverb return
+  // through whatever it outputs to. Following the ROUTING rather than stack
+  // membership matters: djpubichair's "Soft Cinematic" sits in the lead stack
+  // but outputs to Stereo Out, so muting "lead" does not silence it. A track
+  // whose channel is unknown falls back to its stack's main track.
+  const auxRefByBus = new Map<number, number>();
+  for (const strip of strips) {
+    const channel = channelsByRef.get(strip.refKey);
+    if (channel?.kind === 'aux' && channel.inputBus !== null && !auxRefByBus.has(channel.inputBus)) {
+      auxRefByBus.set(channel.inputBus, strip.ref);
+    }
+  }
+  const parentRefByRef = new Map<number, number>();
+  for (const node of arrangeTree ?? []) {
+    if (node.parentRef !== null && !parentRefByRef.has(node.stripRef)) parentRefByRef.set(node.stripRef, node.parentRef);
+  }
+  const downstream = (ref: number): number[] => {
+    const chain: number[] = [];
+    const seen = new Set([ref]);
+    let at = ref;
+    for (;;) {
+      const channel = channelsByRef.get(`0x${at.toString(16)}`);
+      const next = channel
+        ? (channel.outputBus === null ? undefined : auxRefByBus.get(channel.outputBus))
+        : parentRefByRef.get(at);
+      if (next === undefined || seen.has(next)) return chain;
+      seen.add(next);
+      chain.push(next);
+      at = next;
+    }
+  };
+  const trackIdByStrip = new Map<number, string>();
+  for (const track of tracks) if (!trackIdByStrip.has(track.trackRef)) trackIdByStrip.set(track.trackRef, track.id);
+  for (const track of tracks) {
+    const path = [track.trackRef, ...downstream(track.trackRef)];
+    const silencer = path.find((ref) => channelsByRef.get(`0x${ref.toString(16)}`)?.muted);
+    track.muted = silencer !== undefined;
+    track.mutedBy = silencer === undefined ? null : trackIdByStrip.get(silencer) ?? null;
+    track.ownVolume = ownVolumeByRef.get(track.trackRef) ?? null;
+    track.volume = combineVolumeCurves(path.flatMap((ref) => ownVolumeByRef.get(ref) ?? []));
   }
 
   // ---- markers -----------------------------------------------------------

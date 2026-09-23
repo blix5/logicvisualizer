@@ -10,6 +10,7 @@ await build({
     logicAudio: 'src/main/logic/logicAudio.ts',
     logicAutomation: 'src/main/logic/logicAutomation.ts',
     midiRegions: 'src/main/logic/midiRegions.ts',
+    trackTree: 'src/main/logic/trackTree.ts',
     fileTempo: 'src/main/audio/fileTempo.ts',
     buildProject: 'src/main/project/buildProject.ts',
     peaks: 'src/renderer/render/peaks.ts',

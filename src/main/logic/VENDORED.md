@@ -30,6 +30,7 @@ Source: `/Users/peter/texture-app/src/music_clipboard/electron_ui/app/src/logic/
 | `trackNames.ts` | extracted from `logicProject.ts` (the three name strategies) |
 | `midiRegions.ts` | rewritten — joins `scanRegionCells` (position/length) with a note-block walk |
 | `logicAudio.ts` | **new.** Texture parses no audio at all |
+| `trackTree.ts` | **new.** Texture walks the same track nodes but reads no stack fields |
 
 ## Audio format notes
 
@@ -239,6 +240,112 @@ re_probe8, which mutes exactly tracks 2 and 3: the flag is set on those two and
 on no channel of re_probe6 or re_probe7, which mute nothing. A rival candidate at
 `+117` bit 3 was **rejected** — it fires on the unmuted probes too.
 
+### Track stacks — solved
+
+**The arrange track list is the song-root folder.** It is the type-`0x17` `qeSM`
+cell named after the project, holding one 94-byte `karT` node per track in
+Logic's order, with the output strip's node last. (The "Track Automation Root
+Folder" holds `karT` nodes too, one per strip, in no useful order.)
+
+| Offset | Meaning |
+|---|---|
+| `+18` u32 | ordinal: **track number − 1**, exactly as the track header shows it |
+| `+28` u32 | payload **58** — or **57** in older projects, same layout one byte short |
+| `+36` u16 | node type: `1` almost always, `3` the output strip (not a track), `5` a second track on an already-used strip; `6` and `10` also occur and are real tracks |
+| `+44` u32 | strip ref (the `ivnE` id, and the placement's `+16` track ref) |
+| `+50` u8 | **stack depth**: 0 top level, 1 in a stack, 2 in a nested stack |
+| `+76` u8 | **bit 6 = stack head** (the stack's main track); **bit 7 = expanded**, meaningful only on a head |
+
+The list is flat: a stack is its head followed by the run of tracks one level
+deeper. Established from `djpubichair.logicx`, whose owner listed all six
+summing stacks by track number from Logic's headers. Every track number and all
+41 members matched, and so did the tracks just after each stack (9, 14, 24, 31,
+53), which sit at depth 0. `limbo.logicx`'s WindowImage confirms nesting and bit
+7. "Sum 18" (`0xc0`, open) holds two "Natural Finger Pick" stacks (`0x40`, both
+drawn collapsed), each holding three depth-2 tracks.
+
+Across ~/Music/Logic: all 61 projects yield a list (103 stack heads, 560
+members), every member sits exactly one level below its head, and a placement's
+`+20` track number names the same strip as the list in **15,865 of 15,868**
+placements. Three in `i love crack.logicx` disagree; they resolve by strip ref.
+
+The old ordering came from `listLogicTracks`. It demanded payload 58, so it
+refused the 18 older-format projects outright. It kept only node type 1, which
+dropped limbo's two "Brit and Clean" tracks (type 10) and renumbered everything
+after them. And any strip it did not list took `tracks.length` as its index,
+which collided with real ordinals and put Stereo Out and Master among the first
+tracks. That walk is now only a fallback. Where the song-root list exists, it
+defines which tracks exist, so strips it does not list (Stereo Out, Master, aux
+strips with no arrange track) are no longer tracks: djpubichair goes from 62
+"tracks" to its real 57.
+
+**Two tracks can share one strip.** `dark.logicx` tracks 2 and 3, and `keshi beat
+v33`'s 50 and 51, name the same strip; the second has node type 5. They get
+separate ids, and a placement joins on strip ref *and* track number.
+
+### Summing and buses — the mixer routing
+
+A summing stack's head is an **Aux** channel, and its members output to the bus
+that Aux listens to. On the `OCuA` channel record:
+
+| Offset | Meaning |
+|---|---|
+| `+0x80` u16 | output: **0 = Stereo Out**, N = Bus N |
+| `+0x82` u16 | input: on an Aux, the **bus it listens to**; on an audio channel, the hardware input; `0xffff` none |
+
+In djpubichair, "lead" is Aux 4, listening to Bus 4, and its members output to
+Bus 4. The same holds for outro (Aux 10 on Bus 9), instrumentals (Aux 3 on
+Bus 3), bass sum (Aux 6 on Bus 6), sfx (Aux 5 on Bus 5) and drums (Aux 2 on
+Bus 2). Across the corpus 90 of 103 heads are Aux channels, and **543 of 560**
+members output to their head's input bus. The exceptions are genuine:
+
+- djpubichair's **track 7 "Soft Cinematic"** sits in the lead stack but outputs
+  to **Stereo Out**, as its channel inspector in the WindowImage shows. It reaches
+  the stack only through a **Bus 1 send** to track 8.
+- **Track 8 "Large Hall/Concert Hall" is an aux track** (the "bus" in the
+  owner's list): **Aux 1, listening to Bus 1, outputting to Bus 4**, so the
+  reverb return is summed into "lead". Aux tracks are ordinary nodes in the list;
+  their channel is what makes them an aux.
+- `synth thingy*` put reverb aux returns inside stacks while they output to
+  Stereo Out, like track 7.
+- The 12 non-Aux heads are **audio tracks**: the per-stem tracks ("(Vocals)",
+  "(Drums)", …) inside the stem-splitter stacks of `justinbiebreb` and
+  `smthidk`. They are stacks within a summing stack. The remaining head,
+  `lucas.logicx`'s Drum Machine Designer "Empty Kit", matches no channel.
+- Channel-strip patches build summing stacks too. `test chords`'s "Heavenly
+  Tweed" (node type 10) is an Aux head over the recording track ("Amp") and
+  an effect aux ("Heavenly Mod"), all on Bus 5.
+
+**Stack mute and automation reach the tracks routed into it.** A summing
+stack's mute is simply its Aux channel's mute (`OCuA +126`), and its volume
+automation is an ordinary lane on the head's strip. djpubichair's owner muted
+"sfx" and automated "drums", and both decode with no new fields. Logic applies
+them to everything summed through that Aux, so the model does too, by following
+the **routing** rather than stack membership. Each channel is heard through
+every Aux its output feeds, hop by hop to Stereo Out. `TrackModel.muted` is true
+when any channel on that path is muted, and `mutedBy` names which. `volume`
+combines every fader on the path (gains multiply, so fader = 90 · Π(v/90)), and
+`ownVolume` keeps the track's own lane. Routing is what makes track 7
+right: it sits in "lead" but outputs to Stereo Out, so lead's automation does
+not reach it, while the reverb aux on track 8 (output Bus 4) is heard through
+lead. A track whose channel is unknown falls back to its stack's main track.
+Across the corpus, 69 tracks are silenced by a stack upstream and 100 are heard
+through someone else's volume lane.
+
+**A channel UUID can contain `0xff`.** Strips join to channels by the channel's
+UUID, found after an `0xff` byte. The old scan kept the *last* `0xff` + 16
+bytes, and when the UUID itself contained `0xff` that window started inside it,
+so the join failed. djpubichair's Inst 7 is `d2166f96…45ff690f09`, so
+"Vintage Silk Motion" had no channel and lost its mute (57 channels in the
+corpus). The field is not at a fixed offset either (channel end − 49 holds for
+only half), so every candidate is kept and the strip picks the real one.
+
+**Strip names are length-prefixed**, u16 at `ivnE +0xc2` with the name after it,
+not null-terminated. Reading `+0xc4` as a C string ran into the next field
+("lead lullabyC", "Liquid CrystalD"). Stripping trailing digits to tidy that
+turned "glitch 1" into "glitch" and "kick 2" into "kick". 332 of 1,178 track
+names across the corpus changed, all toward what Logic shows.
+
 ### Region mute and fades — solved
 
 Three probes, all built on re_probe5 (three audio regions on one track, 120 BPM):
@@ -403,6 +510,18 @@ also carry a sub-tick fraction at `+2` (u16 / 65536), as on placements.
 bassthing's "guitar thingy scream" decodes to 0 dB at 16 3 1 0, -inf at 16 3 1 18,
 held to 16 3 2 196 and eased back to 0 dB at bar 17, matching its arrange view.
 
+**That was still too strict.** Rows in an automation list come from a whole
+family of markers: `0x50`-`0x58` (the `0x51`+ ones float-valued, mostly with
+parameter id `0x1d`, likely plugin parameters), `0x8050`, and in djpubichair
+`0xe0`. None of these is decoded. Any of them outside `0x51` still rejected the
+chunk, which dropped **27 of the 96** volume-bearing lanes. One was the lane its
+owner drew on djpubichair's "drums" stack (0 dB at bar 25 to -inf at bar 41,
+2,924 points), which shares its chunk with 182 rows of marker `0x54`. Inside a
+chunk known to be automation, because its cell is named `*Automation`, every
+row that is not `0x50` is now skipped. All 96 lanes decode, and all stay in time
+order. A chunk NOT known to be automation keeps the strict rule, since it may be
+some other 16-byte structure.
+
 **Each lane belongs to the track named by its sequence's region cell.** An
 automation list is stored like a MIDI region: a cell named `*Automation` whose
 qSvE *is* the automation chunk, with the track ref at qSvE - 111 like any
@@ -433,6 +552,16 @@ stores 58.8, and Logic displays it as -7.4 dB, which is what the law gives.
 - **MIDI start-trim**, if it exists. No region in the corpus has notes starting
   before it, so there is nothing to shift, but a probe that trims a MIDI
   region's START would confirm whether a content offset is stored anywhere.
+- **Sends.** Soft Cinematic's Bus 1 send is visible in its WindowImage but is
+  not decoded; a probe adding one send to one channel would find it.
+- **Folder stacks.** Every stack in the corpus is a summing stack or an
+  audio-track head; no plain folder stack exists to show whether a `+76` bit
+  tells the two apart. `StackModel.summing` is derived from the head being an
+  Aux instead. A probe with one folder stack and one summing stack would settle it.
+- **Hardware outputs.** Only Stereo Out (0) and buses have been seen at `+0x80`.
+  Routing to "Output 3-4" may reuse the same numbers.
+- **Node types 6 and 10** are real tracks, but what makes them different is not
+  known.
 - **Plugin-parameter automation.** Only ids `0x07` and `0x0a` have been seen; a
   probe automating a plugin parameter would show whether those ids extend.
 

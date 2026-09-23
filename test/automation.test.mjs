@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  faderAt, faderToAmplitude, faderToLevel, volumeGain, volumeLevel, FADER_UNITY,
+  faderAt, faderToAmplitude, faderToLevel, volumeGain, volumeLevel, combineVolumeCurves, FADER_UNITY,
 } from '../.test-build/automation.mjs';
 
 const curve = (points) => ({
@@ -33,4 +33,19 @@ test('opacity level is linear in fader units and never exceeds unity', () => {
 test('a track without automation is left untouched', () => {
   assert.equal(volumeGain(null, 5), 1);
   assert.equal(volumeLevel(null, 5), 1);
+});
+
+test('faders in series multiply their gains', () => {
+  // A member at -12 dB (45) inside a stack whose fader ramps unity -> -inf:
+  // heard at 45 * (stack / 90).
+  const member = curve([[0, 45]]);
+  const stack = curve([[10, 90], [20, 0]]);
+  const heard = combineVolumeCurves([member, stack]);
+  assert.deepEqual([...heard.seconds], [0, 10, 20]);
+  assert.equal(faderAt(heard, 5), 45);
+  assert.equal(faderAt(heard, 15), 22.5);
+  assert.equal(faderAt(heard, 25), 0);
+  assert.ok(Math.abs(volumeGain(heard, 15) - volumeGain(member, 15) * volumeGain(stack, 15)) < 1e-12, 'amplitudes multiply');
+  assert.equal(combineVolumeCurves([member]), member, 'one curve is returned as is');
+  assert.equal(combineVolumeCurves([]), null);
 });

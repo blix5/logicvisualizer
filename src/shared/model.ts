@@ -15,10 +15,58 @@ export type TrackModel = {
   color: string;
   colorSource: 'project' | 'fallback' | 'user';
   trackRef: number;
-  /** Track mute, read from its mixer channel. */
+  /**
+   * Whether the track is heard: true when its own channel is muted OR any
+   * channel its output passes through is (a muted summing stack silences its
+   * members). See mutedBy.
+   */
   muted: boolean;
-  /** Volume automation, or null when the track has none. */
+  /**
+   * The track whose mute silences this one: itself, a stack's main track or an
+   * aux track. null when unmuted, or when the muted channel has no arrange track.
+   */
+  mutedBy: string | null;
+  /**
+   * The volume automation the track is heard at: its own fader combined with
+   * every channel its output passes through (a summing stack's fader scales all
+   * its members). null when none of them is automated.
+   */
   volume: VolumeCurve | null;
+  /** The track's own volume automation, as drawn on its own lane. */
+  ownVolume: VolumeCurve | null;
+  /**
+   * Logic's track number as its track header shows it, or null when the
+   * arrange list was not found and arrangeIndex is only file order.
+   */
+  number: number | null;
+  /** Track-stack nesting: 0 at top level, 1 inside a stack, 2 in a nested stack. */
+  depth: number;
+  /** id of the stack's main track when this track sits inside a stack. */
+  parentId: string | null;
+  /** Set when this track is a stack's main track. */
+  stack: StackModel | null;
+  /** The track's mixer channel, when it could be matched. */
+  channel: ChannelModel | null;
+};
+
+export type StackModel = {
+  /**
+   * A summing stack: the main track is an Aux, and its members' outputs are
+   * summed into it. False for a stack whose main track is an ordinary channel.
+   */
+  summing: boolean;
+  /** Logic shows the members (the disclosure triangle is open). */
+  expanded: boolean;
+};
+
+export type ChannelModel = {
+  /** Logic's channel name: "Aux 4", "Inst 15", "Audio 24". */
+  name: string;
+  kind: 'audio' | 'instrument' | 'aux' | 'other';
+  /** The bus this channel outputs to, or null for Stereo Out. */
+  outputBus: number | null;
+  /** The bus an Aux listens to; null on anything that is not an Aux. */
+  inputBus: number | null;
 };
 
 type RegionBase = {

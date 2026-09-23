@@ -63,6 +63,20 @@ test('a list with a wrong record marker is rejected', () => {
   assert.deepEqual(parseAutomationLanes(buffer), []);
 });
 
+test('a chunk known to be automation skips rows it does not decode', () => {
+  // djpubichair's "drums" stack: 2924 volume rows interleaved with 182 rows of
+  // marker 0x54 (parameter 0x1d). Outside a known "*Automation" cell such a
+  // chunk is still rejected, since it may not be automation at all.
+  const buffer = automationChunk([
+    { bar: 0, fader: 90 }, { bar: 1, fader: 3, marker: 0x54, param: 0x1d }, { bar: 24, fader: 90 },
+    { bar: 32, fader: 45, marker: 0x57, param: 0x1d }, { bar: 32, fader: 45 }, { bar: 40, fader: 0 },
+  ]);
+  assert.deepEqual(parseAutomationLanes(buffer), []);
+  const [lane, ...rest] = parseAutomationLanes(buffer, new Set([0]));
+  assert.equal(rest.length, 0);
+  assert.deepEqual(lane.points.map((p) => [p.positionTicks / BAR, p.value]), [[0, 90], [24, 90], [32, 45], [40, 0]]);
+});
+
 test('parameters sharing one chunk are split into separate lanes', () => {
   // Logic interleaves every automated parameter into the same record list;
   // without splitting on the parameter id, pan looks like out-of-range volume.
