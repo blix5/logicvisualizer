@@ -15,21 +15,22 @@ import {
   PianoRollIcon,
   PlayIcon,
   ReloadIcon,
-  SparklesIcon,
   ToStartIcon,
 } from './components/icons';
 import { AppearanceMenu } from './components/AppearancePanel';
-import { Dropdown } from './components/Dropdown';
+import { VisualsMenu } from './components/VisualsPanel';
 import { NumberField } from './components/NumberField';
 import { RecentGrid, RecentMenu, useRecentProjects } from './components/RecentProjects';
 import { TranscriptionStore } from './audio/TranscriptionStore';
 import { reduceBufferPeaks } from './audio/reducePeaks';
-import { ArrangeRenderer, type RenderMode, type StereoSpectrum } from './render/ArrangeRenderer';
+import { ArrangeRenderer, type RenderMode } from './render/ArrangeRenderer';
 import { PianoRollRenderer } from './render/PianoRollRenderer';
 import type { PeakPyramid } from './render/peaks';
 import { buildRollScene } from './render/rollScene';
 import { buildScene } from './render/scene';
-import { SPECTRUM_MODES, type SpectrumMode } from './render/spectrum';
+import { AudioFeatures } from './visuals/AudioFeatures';
+import { VisualStack } from './visuals/VisualStack';
+import { useVisuals } from './visuals/useVisuals';
 import { AudioClock } from './transport/AudioClock';
 import { Backdrop } from './render/backdrop';
 import { resolveTrackColors } from './theme/palettes';
@@ -113,16 +114,15 @@ export function App(): JSX.Element {
   const [peaksVersion, setPeaksVersion] = useState(0);
   /** Piano-roll display options. */
   const [convertAudio, setConvertAudio] = useState(false);
-  const [spectrumMode, setSpectrumMode] = useState<SpectrumMode>('none');
   const [headerHidden, setHeaderHidden] = useState(() => readFlag(HEADER_HIDDEN_KEY));
   const [statusHidden, setStatusHidden] = useState(() => readFlag(STATUS_HIDDEN_KEY));
-  const [particles, setParticles] = useState(false);
   /** Bumped as transcriptions land, which rebuilds the roll scene. */
   const [transcriptVersion, setTranscriptVersion] = useState(0);
   const { recents, record: recordRecent, remove: removeRecent } = useRecentProjects();
   const appearance = useAppearance();
   const { theme, settings: appearanceSettings } = appearance;
   const backgroundImage = useBackgroundImage();
+  const visuals = useVisuals();
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -146,8 +146,9 @@ export function App(): JSX.Element {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const peakStoreRef = useRef<PeakStore | null>(null);
   const transcriptStoreRef = useRef<TranscriptionStore | null>(null);
-  /** Reused analyser read-outs for the stereo spectrum, left then right. */
-  const spectrumRef = useRef<{ left: Float32Array<ArrayBuffer>; right: Float32Array<ArrayBuffer> } | null>(null);
+  /** Each view's visual layers, and what they hear, read by the frame loop. */
+  const stacksRef = useRef({ roll: new VisualStack('roll'), arrange: new VisualStack('arrange') });
+  const featuresRef = useRef(new AudioFeatures());
   const scrollTopRef = useRef(0);
   /** Bumped whenever something outside the frame key invalidates the canvas. */
   const dirtyRef = useRef(0);
@@ -156,8 +157,8 @@ export function App(): JSX.Element {
   // Room is kept for the header whether or not it is showing: the title stays
   // up either way, and hiding the toolbar should not reflow the canvas.
   const topInset = HEADER_HEIGHT;
-  const viewRef = useRef({ pixelsPerSecond, mode, bounceOffset, spectrumMode, topInset, particles });
-  viewRef.current = { pixelsPerSecond, mode, bounceOffset, spectrumMode, topInset, particles };
+  const viewRef = useRef({ pixelsPerSecond, mode, bounceOffset, topInset });
+  viewRef.current = { pixelsPerSecond, mode, bounceOffset, topInset };
 
   // The project as drawn: track colours from the chosen palette, adapted to the
   // theme. Only the scenes read it; everything else uses the project as loaded.
@@ -386,8 +387,16 @@ export function App(): JSX.Element {
   useEffect(() => {
     rendererRef.current?.setTheme(theme.canvas);
     rollRendererRef.current?.setTheme(theme.canvas);
+    stacksRef.current.roll.setTheme(theme.canvas);
+    stacksRef.current.arrange.setTheme(theme.canvas);
     dirtyRef.current += 1;
   }, [theme]);
+
+  useEffect(() => {
+    stacksRef.current.roll.setLayers(visuals.settings.roll);
+    stacksRef.current.arrange.setLayers(visuals.settings.arrange);
+    dirtyRef.current += 1;
+  }, [visuals.settings.roll, visuals.settings.arrange]);
 
   useEffect(() => {
     const backdrop = backdropRef.current;
@@ -404,8 +413,7 @@ export function App(): JSX.Element {
     let frame = 0;
     let lastKey = '';
     let lastSounding = 0;
-    let spectrumFrame = 0;
-    let particleFrame = 0;
+    let visualsFrame = 0;
     const tick = () => {
       frame = requestAnimationFrame(tick);
       const renderer = rendererRef.current;
@@ -421,38 +429,36 @@ export function App(): JSX.Element {
       const media = clock ? clock.now() : 0;
       const projectSeconds = media - view.bounceOffset;
 
-      // The spectrum moves with the audio, not the playhead, so while it is on
-      // every frame draws — during playback and for a moment after, while the
-      // analyser's smoothing decays to silence.
-      let spectrum: StereoSpectrum | null = null;
-      if (view.spectrumMode !== 'none' && view.mode === 'roll' && clock) {
+      // Visual layers move with the audio, not the playhead, so while any are
+      // on every frame draws: during playback, for a moment after while the
+      // analysers' smoothing decays, and while a layer is still settling.
+      const stack = view.mode === 'roll' ? stacksRef.current.roll : stacksRef.current.arrange;
+      let animate = false;
+      if (stack.active) {
+        const features = featuresRef.current;
         const now = performance.now();
-        if (clock.isPlaying) lastSounding = now;
-        if (now - lastSounding < 1500) {
-          const bins = clock.analyserLeft.frequencyBinCount;
-          let buffers = spectrumRef.current;
-          if (!buffers || buffers.left.length !== bins) {
-            buffers = { left: new Float32Array(bins), right: new Float32Array(bins) };
-            spectrumRef.current = buffers;
-          }
-          clock.analyserLeft.getFloatFrequencyData(buffers.left);
-          clock.analyserRight.getFloatFrequencyData(buffers.right);
-          spectrum = { ...buffers, sampleRate: clock.analyserLeft.context.sampleRate };
-          spectrumFrame += 1;
+        const playingNow = clock?.isPlaying ?? false;
+        if (playingNow) lastSounding = now;
+        const sounding = !!clock && now - lastSounding < 1500;
+        const needs = stack.needs;
+        if (sounding && clock && (needs.spectrum || needs.wave)) {
+          features.update(clock.analyserLeft, clock.analyserRight, needs, now);
+        } else {
+          features.silence(now);
         }
+        stack.features = features;
+        stack.playing = playingNow;
+        animate = sounding || stack.animating;
+        if (animate) visualsFrame += 1;
       }
-
-      // Particles keep moving after a pause; draw every frame until they settle.
       const roll = rollRendererRef.current;
-      const animating = view.mode === 'roll' && view.particles && (roll?.animating ?? false);
-      if (animating) particleFrame += 1;
 
       // Nothing on screen depends on time beyond where it puts the content, so
       // a paused, untouched view costs nothing. Quarter-pixel granularity is
       // below what the canvas can show.
       const key = `${Math.round(projectSeconds * view.pixelsPerSecond * 4)}|`
         + `${Math.round(scrollTopRef.current)}|${view.pixelsPerSecond}|${view.mode}|`
-        + `${view.bounceOffset}|${view.spectrumMode}|${spectrum ? spectrumFrame : 0}|${view.topInset}|${view.particles}|${animating ? particleFrame : 0}|${dirtyRef.current}`;
+        + `${view.bounceOffset}|${animate ? visualsFrame : 0}|${view.topInset}|${dirtyRef.current}`;
       if (key !== lastKey) {
         lastKey = key;
         const state = {
@@ -465,11 +471,8 @@ export function App(): JSX.Element {
           peaks: peaksLookup,
           bouncePeaks: bouncePeaksRef.current,
           bounceOffset: view.bounceOffset,
-          spectrum,
-          spectrumMode: view.spectrumMode,
-          spectrumLive: clock?.isPlaying ?? false,
+          visuals: stack.active ? stack : null,
           topInset: view.topInset,
-          particles: view.particles,
         };
         if (view.mode === 'roll' && roll && rollScene) roll.draw(rollScene, state);
         else renderer.draw(scene, state);
@@ -518,7 +521,7 @@ export function App(): JSX.Element {
     fit();
     window.addEventListener('resize', fit);
     return () => window.removeEventListener('resize', fit);
-  }, [headerHidden, mode, project, spectrumMode]);
+  }, [headerHidden, mode, project]);
 
   // Keyboard + wheel.
   useEffect(() => {
@@ -727,24 +730,10 @@ export function App(): JSX.Element {
                 >
                   <AudioToMidiIcon />
                 </button>
-                <button
-                  className={`icon${particles ? ' active' : ''}`}
-                  onClick={() => setParticles((on) => !on)}
-                  title="Particles where the playhead meets each note"
-                  aria-label="Particles"
-                  aria-pressed={particles}
-                >
-                  <SparklesIcon />
-                </button>
-                <Dropdown<SpectrumMode>
-                  options={SPECTRUM_MODES}
-                  value={spectrumMode}
-                  onChange={setSpectrumMode}
-                  title="A faint live view of the bounce's spectrum, over everything"
-                  ariaLabel="Spectrum view"
-                />
               </>
             )}
+
+            <VisualsMenu visuals={visuals} mode={mode} />
 
             <AppearanceMenu appearance={appearance} background={backgroundImage} tracks={project?.tracks ?? null} />
 

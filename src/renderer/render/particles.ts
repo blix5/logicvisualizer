@@ -34,7 +34,7 @@ export class ParticleSystem {
   private readonly life = new Float32Array(POOL);
   private readonly maxLife = new Float32Array(POOL);
   private readonly size = new Float32Array(POOL);
-  private readonly color = new Uint16Array(POOL);
+  private readonly color: string[] = new Array<string>(POOL).fill('');
   /** Next slot to write; wraps, which is what recycles the oldest. */
   private next = 0;
   private live = 0;
@@ -51,11 +51,11 @@ export class ParticleSystem {
   }
 
   /**
-   * A burst at (x, y) in colour `color` (an index the caller resolves at draw
-   * time). `strength` is 0..1, from the note's velocity.
+   * A burst at (x, y) in track colour `color`. `strength` is 0..1, from the
+   * note's velocity; `scale` multiplies the burst's size and count.
    */
-  emit(x: number, y: number, color: number, strength: number, pixelsPerSecond: number): void {
-    const count = Math.round(MIN_BURST + (MAX_BURST - MIN_BURST) * Math.max(0, Math.min(1, strength)));
+  emit(x: number, y: number, color: string, strength: number, pixelsPerSecond: number, scale = 1): void {
+    const count = Math.round((MIN_BURST + (MAX_BURST - MIN_BURST) * Math.max(0, Math.min(1, strength))) * Math.max(0.25, scale));
     for (let n = 0; n < count; n += 1) {
       const i = this.next;
       this.next = (this.next + 1) % POOL;
@@ -70,7 +70,7 @@ export class ParticleSystem {
       const life = MIN_LIFE + Math.random() * (MAX_LIFE - MIN_LIFE);
       this.life[i] = life;
       this.maxLife[i] = life;
-      this.size[i] = MIN_SIZE + Math.random() * (MAX_SIZE - MIN_SIZE) * (0.5 + strength * 0.5);
+      this.size[i] = (MIN_SIZE + Math.random() * (MAX_SIZE - MIN_SIZE) * (0.5 + strength * 0.5)) * Math.max(0.5, scale);
       this.color[i] = color;
     }
   }
@@ -98,12 +98,13 @@ export class ParticleSystem {
 
   /**
    * Draws each live particle as `sprite(color)`, fading and shrinking with age,
-   * combined by `blend` (additive on dark themes).
+   * combined by `blend` (additive on dark themes), at `alpha` overall.
    */
   draw(
     ctx: CanvasRenderingContext2D,
     blend: GlobalCompositeOperation,
-    sprite: (color: number) => CanvasImageSource | null,
+    sprite: (color: string) => CanvasImageSource | null,
+    alpha = 1,
   ): void {
     if (this.live === 0) return;
     ctx.globalCompositeOperation = blend;
@@ -115,7 +116,7 @@ export class ParticleSystem {
       const t = life / this.maxLife[i]!;
       const size = this.size[i]! * (0.4 + 0.6 * t);
       // Linear fade: bright for most of the life, gone at the end.
-      ctx.globalAlpha = t;
+      ctx.globalAlpha = t * alpha;
       ctx.drawImage(image, this.x[i]! - size / 2, this.y[i]! - size / 2, size, size);
     }
     ctx.globalAlpha = 1;

@@ -186,6 +186,8 @@ function pitchBands(centres: Float32Array, halfWidth: number, bins: number, samp
 
 export class SpectrumPainter {
   private theme: CanvasTheme = DEFAULT_CANVAS_THEME;
+  /** Multiplies every alpha the painter sets: the visual layer's opacity. */
+  alpha = 1;
   private leftTint: Tint = { rgb: DEFAULT_CANVAS_THEME.spectrum.left, ...LEFT_ALPHAS };
   private rightTint: Tint = { rgb: DEFAULT_CANVAS_THEME.spectrum.right, ...RIGHT_ALPHAS };
 
@@ -312,7 +314,7 @@ export class SpectrumPainter {
     // From the canvas edges, not the pitch rows: nothing cuts them off.
     const drewLeft = this.drawLine(ctx, spectrum.left, columns, layout, layout.canvasHeight, -1, this.leftTint);
     const drewRight = this.drawLine(ctx, spectrum.right, columns, layout, 0, 1, this.rightTint);
-    ctx.globalAlpha = 1;
+    ctx.globalAlpha = this.alpha;
     this.drawChannelLabels(ctx, layout, drewLeft, drewRight);
   }
 
@@ -341,7 +343,7 @@ export class SpectrumPainter {
     // dropping it on a threshold.
     const presence = smoothstep(LOUDNESS_FADE[0], LOUDNESS_FADE[1], loudest);
     if (presence <= 0) return false;
-    ctx.globalAlpha = presence;
+    ctx.globalAlpha = presence * this.alpha;
     ctx.lineWidth = 1;
     ctx.strokeStyle = this.axisGradient(ctx, layout, tint, tint.line);
     ctx.stroke();
@@ -413,7 +415,7 @@ export class SpectrumPainter {
     const presence = smoothstep(LOUDNESS_FADE[0], LOUDNESS_FADE[1], loudest);
     if (presence <= 0) return;
 
-    ctx.globalAlpha = presence;
+    ctx.globalAlpha = presence * this.alpha;
     ctx.globalCompositeOperation = this.theme.blend;
     const left = this.leftTint;
     const right = this.rightTint;
@@ -426,7 +428,7 @@ export class SpectrumPainter {
     ctx.fillStyle = this.axisGradient(ctx, layout, right, right.cap);
     this.capsRight.fillInto(ctx);
     ctx.globalCompositeOperation = 'source-over';
-    ctx.globalAlpha = 1;
+    ctx.globalAlpha = this.alpha;
     this.drawChannelLabels(ctx, layout, presence > 0.3 && this.capsLeft.size > 0, presence > 0.3 && this.capsRight.size > 0);
   }
 
@@ -507,7 +509,7 @@ export class SpectrumPainter {
     ctx.beginPath();
     ctx.rect(layout.keyWidth, 0, layout.width - layout.keyWidth, layout.canvasHeight);
     ctx.clip();
-    ctx.globalAlpha = presence;
+    ctx.globalAlpha = presence * this.alpha;
     ctx.globalCompositeOperation = this.theme.blend;
     ctx.fillStyle = this.pitchGradientLeft!;
     this.pitchLeft.fillInto(ctx);
@@ -620,7 +622,7 @@ export class SpectrumPainter {
     ctx.rect(layout.keyWidth, 0, layout.centreX - layout.keyWidth, layout.canvasHeight);
     ctx.clip();
     ctx.globalCompositeOperation = this.theme.blend;
-    ctx.globalAlpha = 0.8;
+    ctx.globalAlpha = 0.8 * this.alpha;
     ctx.imageSmoothingEnabled = true;
     const top = yOfPitch(layout, this.trailTopPitch);
     const height = yOfPitch(layout, this.trailBottomPitch) - top;

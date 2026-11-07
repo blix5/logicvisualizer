@@ -100,8 +100,17 @@ export function buildProjectModel(selectionPath: string): ProjectModel {
 
   const timeSignatures: TimeSignature[] = [];
   try {
-    for (const list of findSignatureLists(buffer)) {
-      for (const record of list.meterRecords) {
+    // Only the first list is the song's signature track. The scan also matches
+    // stray 16-byte records inside large unrelated chunks, such as the
+    // arrangement, which read as meters like 4/1 or 24/1. Across ~/Music/Logic
+    // the real list always comes first: a payload of 80-176 bytes with a song-start
+    // record at 38400 ticks. Every later list was one of these false matches
+    // (djpubichair, softspotcover, arp swell beat, eb 68 guitar demo), or an
+    // identical copy of the first (keshi beat v33). Each of them raised a false
+    // "meter changes" warning.
+    const [signatureTrack] = findSignatureLists(buffer);
+    if (signatureTrack) {
+      for (const record of signatureTrack.meterRecords) {
         timeSignatures.push({
           // The vendored reader does not expose per-record positions, so every
           // meter is anchored at beat 0 for now; a meter CHANGE mid-project is

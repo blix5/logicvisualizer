@@ -28,8 +28,8 @@ import {
 } from './rollScene';
 import { LEVEL_STEPS, NOTE_BUFFER_COUNT, noteBufferIndex, VELOCITY_BUCKETS } from './scene';
 import { volumeGain, type VolumeCurve } from '../../shared/automation';
-import { ParticleSystem } from './particles';
-import { SpectrumPainter } from './spectrum';
+import type { SpectrumLayout } from './spectrum';
+import type { NoteHitBuffer } from '../visuals/NoteHitBuffer';
 import type { Backdrop } from './backdrop';
 import { DEFAULT_CANVAS_THEME, type CanvasTheme } from '../theme/themes';
 import { rgbTriplet } from '../theme/color';
@@ -54,7 +54,7 @@ const ROLL_BLEED = 12;
 /** Space kept clear under the bounce waveform. */
 const BOUNCE_BOTTOM_ROOM = 14;
 /**
- * Particles fire for notes the playhead crossed since the last frame, but only
+ * Note hits (for particles and ripples) fire for notes the playhead crossed since the last frame, but only
  * on steady forward playback: a backwards move or a bigger jump is a seek or a
  * scrub, and would otherwise set off every note it skipped.
  */
@@ -125,13 +125,15 @@ export class PianoRollRenderer {
   private playheadBand: CanvasGradient | null = null;
   private gradientKey = '';
 
-  private readonly spectrum = new SpectrumPainter();
-  private readonly particles = new ParticleSystem();
-  private particleScene: RollScene | null = null;
   private lastPlayhead = Number.NaN;
-  /** This frame: whether to emit, and the playhead position emission counts from. */
-  private emitting = false;
+  /** This frame: where note hits go (null when nothing wants them), and the playhead position they count from. */
+  private hits: NoteHitBuffer | null = null;
   private emitFrom = 0;
+  /** Where the roll sits, for the visual layers; refreshed each frame. */
+  private readonly visualLayout: SpectrumLayout = {
+    width: 0, centreX: 0, rollTop: 0, rollBottom: 0, keyWidth: KEY_WIDTH, pitchLow: 0, pitchHigh: 127,
+    pitchY: this.pitchY, rowHeight: 1, canvasHeight: 0, pixelsPerSecond: 1, playheadSeconds: 0, live: false, scene: {},
+  };
 
   // Envelope scratch, reused every frame.
   private envHigh = new Float32Array(1024);
@@ -160,7 +162,6 @@ export class PianoRollRenderer {
     this.spriteCache.clear();
     this.layoutKey = '';
     this.gradientKey = '';
-    this.spectrum.setTheme(theme);
   }
 
   /** The background image to draw under this view, or null for none. */
@@ -200,11 +201,6 @@ export class PianoRollRenderer {
     }
     this.spriteCache.set(key, canvas);
     return canvas;
-  }
-
-  /** True while particles are still in flight, so the caller keeps drawing after a pause. */
-  get animating(): boolean {
-    return this.particles.animating;
   }
 
   clear(): void {
@@ -363,15 +359,39 @@ export class PianoRollRenderer {
     const windowEnd = playhead + (width - centreX) * spp;
     const toX = (seconds: number) => centreX + (seconds - playhead) * pps;
 
-    // Particles belong to one scene (their colours index its tracks) and stop
-    // when switched off.
-    if (!view.particles || scene !== this.particleScene) this.particles.clear();
-    this.particleScene = scene;
+    const visuals = view.visuals ?? null;
+    const layout = this.visualLayout;
+    layout.width = width;
+    layout.centreX = centreX;
+    layout.rollTop = this.rollTop;
+    layout.rollBottom = this.rollBottom;
+    layout.pitchLow = scene.pitchLow;
+    layout.pitchHigh = scene.pitchHigh;
+    layout.rowHeight = this.rowHeight;
+    layout.canvasHeight = height;
+    layout.pixelsPerSecond = pps;
+    layout.playheadSeconds = playhead;
+    layout.live = visuals?.playing ?? false;
+    layout.scene = scene;
+    const drawVisuals = !!visuals && visuals.begin({
+      width,
+      height,
+      dpr: this.dpr,
+      top: view.topInset ?? 0,
+      centreX,
+      centreY: (this.rollTop + this.rollBottom) / 2,
+      playheadSeconds: playhead,
+      pixelsPerSecond: pps,
+      roll: layout,
+      scene,
+    });
+    if (drawVisuals) visuals.drawBack(ctx);
     const moved = playhead - this.lastPlayhead;
-    this.emitting = !!view.particles && moved > 0 && moved <= MAX_EMIT_STEP_SECONDS;
+    this.hits = drawVisuals && visuals.needs.hits && moved > 0 && moved <= MAX_EMIT_STEP_SECONDS
+      ? visuals.pendingHits
+      : null;
     this.emitFrom = this.lastPlayhead;
     this.lastPlayhead = playhead;
-    this.particles.step(performance.now());
 
     this.drawBars(view, toX, width, height, windowStart, windowEnd);
 
@@ -408,28 +428,7 @@ export class PianoRollRenderer {
     this.drawLitKeys(scene);
     const level = this.drawBounce(view, centreX, width, height);
     this.drawPlayhead(centreX, height, level);
-    this.particles.draw(ctx, this.theme.blend, (color) => {
-      const track = scene.tracks[color];
-      return track ? this.sprite(track.color) : null;
-    });
-    if (view.spectrumMode && view.spectrumMode !== 'none') {
-      this.spectrum.draw(ctx, view.spectrumMode, view.spectrum ?? null, {
-        width,
-        centreX,
-        rollTop: this.rollTop,
-        rollBottom: this.rollBottom,
-        keyWidth: KEY_WIDTH,
-        pitchLow: scene.pitchLow,
-        pitchHigh: scene.pitchHigh,
-        pitchY: this.pitchY,
-        rowHeight: this.rowHeight,
-        canvasHeight: height,
-        pixelsPerSecond: view.pixelsPerSecond,
-        playheadSeconds: view.playheadSeconds,
-        live: view.spectrumLive ?? false,
-        scene,
-      });
-    }
+    if (drawVisuals) visuals.drawFront(ctx);
   }
 
   private drawBars(
@@ -652,9 +651,9 @@ export class PianoRollRenderer {
         const level = track.level[i]!;
         if (level === 0) continue;
 
-        if (this.emitting && start > this.emitFrom && start <= playhead) {
+        if (this.hits && start > this.emitFrom && start <= playhead) {
           const strength = (track.bucket[i]! / (VELOCITY_BUCKETS - 1)) * (level / LEVEL_STEPS);
-          this.particles.emit(toX(playhead), y + noteHeight / 2, t, strength, pps);
+          this.hits.push(toX(playhead), y + noteHeight / 2, track.color, strength);
         }
         if (playhead >= start && playhead <= start + duration) {
           const slot = this.flashes.size;
@@ -748,8 +747,8 @@ export class PianoRollRenderer {
       const velocity = track.bucket[i]! / (VELOCITY_BUCKETS - 1);
       const loudness = level / LEVEL_STEPS;
       const strength = velocity * loudness;
-      if (this.emitting && start > this.emitFrom && start <= playhead) {
-        this.particles.emit(toX(playhead), centre, t, strength, pps);
+      if (this.hits && start > this.emitFrom && start <= playhead) {
+        this.hits.push(toX(playhead), centre, track.color, strength);
       }
 
       ctx.fillStyle = this.shade(track.color, sounding ? 0.35 : 0.16);

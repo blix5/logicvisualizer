@@ -56,6 +56,20 @@ test('real projects parse and satisfy the model invariants', { skip: projects.le
         if (file.absolutePath) assert.equal(typeof file.exists, 'boolean');
       }
 
+      // Logic Pro 13 appends undo snapshots of the whole song to ProjectData.
+      // Reading them placed every region dozens of times over (132k audio
+      // regions in djpubichair instead of ~2k), so a region id must be unique.
+      const ids = new Set();
+      for (const region of model.regions) {
+        assert.ok(!ids.has(region.id), `${name}: region ${region.name} placed twice`);
+        ids.add(region.id);
+      }
+
+      // Only projects with a real meter change may warn about one; the rest
+      // used to warn on stray 4/1-style matches inside the arrangement chunk.
+      const meterWarned = model.warnings.some((w) => w.startsWith('Meter changes'));
+      assert.equal(meterWarned, ['freestyle track 7 test.logicx', 'ogkeshibeat.logicx'].includes(name), `${name}: meter warning`);
+
       // MIDI regions must not overlap on a lane. They used to, badly: taking
       // position from the region cells rather than the arrangement placements
       // put mega_test's regions every 2 bars with 4-bar lengths.

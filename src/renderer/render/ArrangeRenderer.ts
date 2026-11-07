@@ -16,7 +16,7 @@ import { levelForPixelsPerSecond, peakCount, type PeakPyramid } from './peaks';
 import { fadeGain, hasFade } from './fade';
 import { volumeGain, type VolumeCurve } from '../../shared/automation';
 import { RectBuffer } from './rectBuffer';
-import type { SpectrumMode } from './spectrum';
+import type { VisualStack } from '../visuals/VisualStack';
 import type { Backdrop } from './backdrop';
 import { DEFAULT_CANVAS_THEME, type CanvasTheme } from '../theme/themes';
 import {
@@ -55,19 +55,13 @@ export type ViewState = {
   bouncePeaks?: PeakPyramid | null;
   /** Bounce seconds minus project seconds; places the bounce on the timeline. */
   bounceOffset?: number;
-  /** Live analyser output per channel, for the piano roll's spectrum views. */
-  spectrum?: StereoSpectrum | null;
-  /** Which spectrum view the piano roll draws over everything. */
-  spectrumMode?: SpectrumMode;
-  /** True while audio is playing: the spectrogram trail only records then. */
-  spectrumLive?: boolean;
+  /** This view's visual layers, or null when none are on. */
+  visuals?: VisualStack | null;
   /**
    * Pixels at the top covered by the floating toolbar. Arrange starts below it
    * so the ruler stays readable; the piano roll draws underneath on purpose.
    */
   topInset?: number;
-  /** Piano roll: burst particles where the playhead meets each note. */
-  particles?: boolean;
 };
 
 const LANE_LABEL_WIDTH = 168;
@@ -91,6 +85,14 @@ function backdropVeil(opacity: number): { lane: number; ruler: number; labels: n
   return { lane: 0.3 * room, ruler: 0.2 + 0.4 * room, labels: 0.4 + 0.45 * room };
 }
 const NO_VEIL = { lane: 1, ruler: 1, labels: 1 } as const;
+/** Grounds over visual layers placed behind the lanes, so they glow through. */
+const VISUALS_VEIL = { lane: 0.4, ruler: 0.65, labels: 0.8 } as const;
+/**
+ * Note hits fire for notes the playhead crossed since the last frame, on
+ * steady forward playback only: a bigger jump is a seek and would set off
+ * every note it skipped.
+ */
+const MAX_EMIT_STEP_SECONDS = 0.25;
 
 export function withAlpha(color: string, alpha: number): string {
   // Track colours are hsl(...) strings; hsl() accepts a slash-alpha suffix.
@@ -115,6 +117,13 @@ export class ArrangeRenderer {
   /** Muted regions' notes and waveforms, flushed together in grey. */
   private readonly mutedNotes = new RectBuffer();
   private readonly mutedWaveform = new RectBuffer();
+  /** Note hits for the visual layers: whether to collect them this frame, and from where. */
+  private lastPlayhead = Number.NaN;
+  private emitting = false;
+  private emitFrom = 0;
+  /** Canvas y of lane-space y = 0 this frame, for placing hits. */
+  private hitOffsetY = 0;
+  private hitBottom = 0;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -185,10 +194,39 @@ export class ArrangeRenderer {
     ctx.globalAlpha = 1;
     ctx.shadowBlur = 0;
     this.paintBackground();
+    const centreX = width / 2;
+    const visuals = view.visuals ?? null;
+    const drawVisuals = !!visuals && visuals.begin({
+      width,
+      height: height + inset,
+      dpr: this.dpr,
+      top: inset,
+      centreX,
+      centreY: inset + height / 2,
+      playheadSeconds: view.playheadSeconds,
+      pixelsPerSecond: view.pixelsPerSecond,
+      roll: null,
+      scene,
+    });
+    if (drawVisuals && visuals.hasBack) {
+      visuals.drawBack(ctx);
+      // Lanes go see-through so what is behind them shows.
+      this.veil = {
+        lane: Math.min(this.veil.lane, VISUALS_VEIL.lane),
+        ruler: Math.min(this.veil.ruler, VISUALS_VEIL.ruler),
+        labels: Math.min(this.veil.labels, VISUALS_VEIL.labels),
+      };
+    }
+    const moved = view.playheadSeconds - this.lastPlayhead;
+    this.emitting = drawVisuals && !!visuals.needs.hits && moved > 0 && moved <= MAX_EMIT_STEP_SECONDS;
+    this.emitFrom = this.lastPlayhead;
+    this.lastPlayhead = view.playheadSeconds;
+    this.hitOffsetY = inset + RULER_HEIGHT - view.scrollTop;
+    this.hitBottom = inset + height;
+
     // Everything below is laid out from y = 0 as before, just shifted down.
     ctx.translate(0, inset);
 
-    const centreX = width / 2;
     const secondsPerPixel = 1 / view.pixelsPerSecond;
     const windowStart = view.playheadSeconds - centreX * secondsPerPixel;
     const windowEnd = view.playheadSeconds + (width - centreX) * secondsPerPixel;
@@ -210,6 +248,7 @@ export class ArrangeRenderer {
 
     this.drawLaneLabels(scene, view, height);
     this.drawPlayhead(centreX, height);
+    if (drawVisuals) visuals.drawFront(ctx);
   }
 
   private drawLane(
@@ -243,7 +282,7 @@ export class ArrangeRenderer {
 
       this.drawRegionBlock(entry.region, lane, laneTop, toX, view, width);
       if (entry.notes) {
-        this.collectNotes(entry.notes, laneTop, toX, view, width, windowStart, windowEnd, entry.region.muted || lane.muted);
+        this.collectNotes(entry.notes, laneTop, toX, view, width, windowStart, windowEnd, entry.region.muted || lane.muted, lane.color);
       }
     }
 
@@ -550,8 +589,11 @@ export class ArrangeRenderer {
     windowStart: number,
     windowEnd: number,
     muted: boolean,
+    color: string,
   ): void {
     const height = batch.noteHeight;
+    const hits = this.emitting && !muted ? view.visuals?.pendingHits ?? null : null;
+    const playhead = view.playheadSeconds;
     const from = firstVisibleNote(batch, windowStart);
 
     for (let i = from; i < batch.count; i += 1) {
@@ -574,6 +616,13 @@ export class ArrangeRenderer {
       // Automated to silence: nothing sounds, so nothing is drawn.
       const level = batch.levels[i]!;
       if (level === 0) continue;
+      if (hits && startSeconds > this.emitFrom && startSeconds <= playhead) {
+        const hitY = this.hitOffsetY + y + height / 2;
+        if (hitY >= this.hitOffsetY + view.scrollTop && hitY <= this.hitBottom) {
+          const strength = (batch.buckets[i]! / (VELOCITY_BUCKETS - 1)) * (level / LEVEL_STEPS);
+          hits.push(toX(playhead), hitY, color, strength);
+        }
+      }
       this.noteBuckets[noteBufferIndex(level, batch.buckets[i]!)]!.push(drawX, y, drawW, height);
     }
   }
